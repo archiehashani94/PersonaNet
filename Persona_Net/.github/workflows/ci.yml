@@ -1,0 +1,376 @@
+name: CI
+
+# main and every release branch (RELEASES.md). nightly.yml reads this
+# workflow's push runs on main to decide where `nightly` may move.
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+# Read-only by default. Without this block every job inherits the repository
+# default, which is write-all, and hands that token to third-party actions.
+# Jobs that need more say so themselves (see `audit`).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Every third-party action is pinned to a full-length commit SHA with the tag it
+# resolved from in a trailing comment: a tag is mutable, so `@v4` re-points
+# under us and a compromised upstream reaches CI without a commit here.
+# Dependabot bumps the SHA and the comment together (.github/dependabot.yml).
+#
+# The Rust toolchain is installed with plain `rustup`, which the hosted runners
+# already ship, rather than an action: `dtolnay/rust-toolchain@stable` is a
+# branch ref, and pinning a branch tip gives Dependabot no tag to follow.
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # On vta-sdk 0.73 / affinidi-tdk 0.32 / trust-tasks 0.34, the build
+      # outgrows the runner's memory: vta-sdk turns on all of trust-tasks-rs's
+      # generated specs, and the OOM killer ends the job with exit code 143
+      # and no compiler error. Swap lets the peaks spill to disk. The jobs
+      # below that build the workspace carry the same step.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        if: runner.os == 'Linux'
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - name: Test with default features (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: cargo test --workspace
+      - name: Test without openpgp-card (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --no-default-features
+
+  test-no-default-features:
+    name: Test (no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies
+        # libpcsclite-dev: the pcsc build script runs even with default
+        # features off (dev-dependency chain), and needs the system lib.
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libpcsclite-dev pkgconf
+      - run: cargo test --workspace --no-default-features
+      # Guard the structure-aware fuzzing seam (issue #124): the cargo-fuzz
+      # harnesses build openvtc-core with `--no-default-features --features
+      # arbitrary`, so check that exact shape and run the Arbitrary seam test.
+      - name: Fuzz-shape build + Arbitrary derive seam
+        run: |
+          cargo check -p openvtc-core --no-default-features --features arbitrary
+          cargo test -p openvtc-core --features arbitrary --lib
+
+  test-dev-overrides:
+    name: Test (dev-overrides)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      # The trust-anchor env overrides compile only under this feature, so the
+      # default jobs never see that code. Lint and test it explicitly.
+      - run: cargo clippy -p openvtc --all-targets --features dev-overrides -- -D warnings
+      - run: cargo test -p openvtc --features dev-overrides
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - run: cargo bench --workspace --no-run
+
+  msrv:
+    name: Minimum Supported Rust Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      # Pinned to the workspace's `rust-version`; move both together.
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - run: cargo check --workspace
+
+  guards:
+    # Cheap, build-free guards that protect the release pipeline: lockstep
+    # versions, CHANGELOG / RELEASE consistency (scripts/check-release-guards.py).
+    name: release guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The base commit, for "RELEASE never moves backwards".
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Release guards
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/check-release-guards.py ${BASE_SHA:+--base-sha "$BASE_SHA"}
+
+  semver:
+    # Patch releases must be semver-compatible. Every PR into a release branch
+    # (a backport, a `release-direct` fix, a prep PR) is checked against the
+    # branch tip it merges into — not against crates.io, whose newest version
+    # may belong to a later release line.
+    name: semver (patch-compatible)
+    if: github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: semver
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: cargo semver-checks --release-type patch
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cargo semver-checks --workspace \
+            --release-type patch \
+            --baseline-rev "$BASE_SHA"
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    # `checks: write` is what audit-check needs to publish its advisories as
+    # check-run annotations; without it the action cannot create the check and
+    # the job fails on that instead of on the advisory. Narrower than the
+    # repository default this job would otherwise inherit.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Cargo Deny (licenses + advisories + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
+  coverage:
+    name: Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Swap: see the clippy job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-build
+          sudo chmod 600 /swapfile-build
+          sudo mkswap /swapfile-build > /dev/null
+          sudo swapon /swapfile-build
+          free -h
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # `@cargo-llvm-cov` is a tool tag that upstream re-points on every
+      # release, so the tool moves to the `with: tool:` input and the action
+      # itself takes a versioned tag Dependabot can track.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-llvm-cov
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libdbus-1-dev
+      - name: Generate coverage (lcov)
+        # Includes ignored tests so any future #[ignore]-gated integration
+        # tests still contribute to the report.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info -- --include-ignored
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lcov.info
+          path: lcov.info
+          retention-days: 30

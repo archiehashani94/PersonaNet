@@ -1,0 +1,134 @@
+# cargo-deny configuration
+#
+# Run with `cargo deny check` (or the per-section variants:
+#   `cargo deny check advisories`
+#   `cargo deny check licenses`
+#   `cargo deny check bans`
+#   `cargo deny check sources`
+# )
+#
+# CI runs all four. Locally, advisories drift fastest — re-run after
+# `cargo update` if you start seeing new warnings.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack — timing sidechannel in the `rsa`
+    # crate's RSA key operations. There is no upstream patch yet; the
+    # affected code is reachable only through `pgp`/`openpgp-card-rpgp`/
+    # `ssh-key`. We don't perform RSA operations against attacker-observable
+    # network timing — the relevant call sites are local OpenPGP card
+    # unlock and SSH key parsing — so the residual exposure is limited.
+    # Re-evaluate when the `rsa` crate ships a constant-time implementation.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2024-0436: paste is unmaintained. Build-time proc-macro
+    # pulled transitively via vta-service/vti-common (utoipa-axum). No
+    # runtime code; falls off when utoipa migrates off paste.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0173: proc-macro-error2 is unmaintained. Same shape as
+    # the `paste` entry above and narrower in reach: a build-time
+    # proc-macro with no runtime code, and it enters only through the
+    # **dev** graph — vta-service 0.24 -> vti-rooms -> openmls_rust_crypto
+    # -> hpke-rs -> libcrux-sha3 -> hax-lib. Nothing the shipped binary
+    # links reaches it. It arrived with the vta-sdk 0.34 refresh, which is
+    # when vta-service grew the rooms crates; it falls off when hax-lib
+    # migrates off the macro.
+    "RUSTSEC-2026-0173",
+    # RUSTSEC-2026-0387: crypto-bigint timing variability, fixed in 0.7.6.
+    # The 0.7 line is updated; what remains is crypto-bigint 0.5.5, reached
+    # only through pgp 0.20 (and openpgp-card-rpgp on top of it) via
+    # elliptic-curve 0.13 and cx448. No 0.5.x patch exists. Falls off when
+    # pgp moves to elliptic-curve 0.14 — re-check on the next pgp bump.
+    "RUSTSEC-2026-0387",
+]
+# Removed with the vta-sdk 0.34 refresh: RUSTSEC-2025-0134 (rustls-pemfile
+# unmaintained) no longer matches anything in the graph, and cargo-deny warns
+# about an ignore that never fires — an ignore list that keeps entries after
+# their crate is gone stops being a record of accepted risk.
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "BSL-1.0",
+    "0BSD",
+    # bzip2-1.0.6: permissive non-copyleft license used by libbz2-rs-sys
+    # (transitive via pgp -> bzip2). Equivalent in practice to BSD/MIT.
+    "bzip2-1.0.6",
+    # CDLA-Permissive-2.0: permissive Linux Foundation data license used
+    # by webpki-roots / webpki-root-certs (transitive via rustls / reqwest).
+    "CDLA-Permissive-2.0",
+    # MIT-0: MIT with the attribution clause dropped, so strictly more
+    # permissive than the MIT already allowed above. Used by borrow-or-share,
+    # transitive via trust-tasks-rs / vta-service -> jsonschema -> fluent-uri.
+    "MIT-0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+allow = []
+deny = []
+# Crates that legitimately ship multiple versions because the ecosystem
+# hasn't fully moved off the older API yet. Add to skip-tree (not skip)
+# so we suppress the warning for the whole subtree.
+skip = []
+skip-tree = [
+    # Crypto stack still bridges rand 0.8 + rand 0.9 + rand 0.10 (see
+    # workspace Cargo.toml for the rationale; revisit when aes-gcm /
+    # ed25519-dalek-bip32 / pgp move off rand_core 0.6).
+    { name = "rand", version = "0.8" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Empty, and that is the finished state rather than an oversight.
+#
+# This list is the second half of every `[patch.crates-io]` entry in the root
+# `Cargo.toml`: `unknown-git = "deny"` means a patch added there without an entry
+# here fails this check rather than quietly resolving to a source nobody
+# reviewed. So the two files are edited together, or the build says so.
+#
+# Three entries lived here while the stack was mid-flight — VGI (for
+# `did-git-sign` / `vgi-core`), the trust registry (for `trql-client`, reached
+# only through VGI), and VTI (for `vta-sdk` ahead of the release carrying
+# `persona/facet/*`). All three are published now and the patch block is gone,
+# so every dependency resolves from crates.io.
+#
+# Adding one back means adding it in both places, and writing down here what has
+# to happen for it to leave again. The entries that were removed each carried
+# that note, and it is the only reason the unwind was tractable six minors later.
+# Both entries are gone again, and for the reason the paragraph above describes:
+# VTI published `vta-sdk` 0.37 with the `vta-service` 0.26 closure behind it, and
+# VGI published `did-git-sign` 0.4.9. The patch block at the foot of the root
+# `Cargo.toml` went with them, so nothing resolves from a git source and there is
+# nothing left to allow.
+allow-git = []

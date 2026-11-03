@@ -1,0 +1,4233 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use dtg_credentials::DTGCredential;
+use openvtc_core::community_access::{DEFAULT_EXPIRY, DeviceGrant};
+use openvtc_core::config::account::{PersonaId, RelationshipIdentifierDefault};
+use openvtc_core::config::community_context::{
+    ContextDeletion, ContextDeletionPreview, ContextOption, PersonaTakenAlong,
+};
+use openvtc_core::vetting::registry::{DirectoryFilter, EventDraft, ProfileDraft};
+use vta_sdk::protocols::vetting::{
+    VettingMethod, VettingRelationship, decline, request, revoke_statement,
+};
+
+/// Lazily-rendered raw credential JSON for credential detail views.
+///
+/// Holds the credential *source* (an `Arc`, so cloning a panel state is a
+/// pointer bump) and pretty-prints it only when a detail view is actually
+/// rendered — avoiding a `serde_json::to_string_pretty` per credential on
+/// every `sync_from_config` (i.e. every config mutation / inbound message).
+///
+/// Two source shapes exist because the displayed JSON must be **byte-identical**
+/// to the previous eager output:
+///   - [`RawCredential::Vrc`] serializes the `DTGCommon` returned by
+///     `vrc.credential()` directly, preserving struct field order.
+///   - [`RawCredential::Value`] serializes a `serde_json::Value` (membership /
+///     role credentials are stored as `Value` on the community record).
+///
+/// Routing everything through `serde_json::Value` is *not* equivalent: without
+/// the `preserve_order` feature, `Value::Object` sorts keys alphabetically,
+/// which would reorder the `DTGCommon` fields versus the original
+/// struct-field-order output. Keeping the typed source preserves the bytes.
+#[derive(Clone, Debug)]
+pub enum RawCredential {
+    /// A VRC — serialize its `DTGCommon` credential body directly.
+    Vrc(Arc<DTGCredential>),
+    /// A membership/role credential already held as a JSON value.
+    Value(Arc<serde_json::Value>),
+}
+
+impl RawCredential {
+    /// Pretty-print the credential to JSON, matching the previous eager
+    /// `serde_json::to_string_pretty` output byte-for-byte. Called only at
+    /// detail-render / clipboard-copy time.
+    #[must_use]
+    pub fn to_pretty_json(&self) -> String {
+        match self {
+            RawCredential::Vrc(vrc) => serde_json::to_string_pretty(vrc.credential())
+                .unwrap_or_else(|_| "Failed to serialize credential".to_string()),
+            RawCredential::Value(value) => serde_json::to_string_pretty(value.as_ref())
+                .unwrap_or_else(|_| "Failed to serialize credential".to_string()),
+        }
+    }
+
+    /// Whether the credential carries a post-quantum proof (ML-DSA or
+    /// SLH-DSA, alone or in a proof set). Serializes a VRC, so call it when a
+    /// list is built, not per frame.
+    #[must_use]
+    pub fn signed_post_quantum(&self) -> bool {
+        match self {
+            RawCredential::Vrc(vrc) => serde_json::to_value(vrc.credential())
+                .is_ok_and(|v| openvtc_core::proof_check::signed_post_quantum(&v)),
+            RawCredential::Value(value) => {
+                openvtc_core::proof_check::signed_post_quantum(value.as_ref())
+            }
+        }
+    }
+}
+
+// ****************************************************************************
+// Content Panel State
+// ****************************************************************************
+
+/// Top-level state for the content panel (right side of main page).
+#[derive(Clone, Debug, Default)]
+pub struct ContentPanelState {
+    /// Is this content panel currently focused?
+    pub selected: bool,
+    /// Inbox/tasks panel state
+    pub inbox: InboxState,
+    /// Relationships panel state
+    pub relationships: RelationshipsState,
+    /// Credentials (VRCs) panel state
+    pub credentials: CredentialsState,
+    /// Settings panel state
+    pub settings: SettingsState,
+    /// VTA service panel state
+    pub vta: VtaState,
+    /// Logs panel state
+    pub logs: LogsState,
+    /// Communities overview panel state
+    pub communities: CommunitiesState,
+    /// Per-community capabilities view (opened from Communities with `c`).
+    pub capabilities: CapabilitiesState,
+    /// Per-community git repositories view (opened from Communities with `r`).
+    pub repos: super::repos::ReposState,
+    /// Per-community data rooms view (opened from Communities with `o`).
+    pub rooms: super::rooms::RoomsState,
+    /// Per-community elections view (opened from Communities with `e`).
+    pub elections: super::elections::ElectionsState,
+    /// The holder's own identity: personas, pool, profiles, and what each persona
+    /// presents where.
+    pub identity: IdentityState,
+    /// Peer identity vetting: our applications, and our desk as a vetter.
+    pub vetting: VettingState,
+    /// TSP Rev 3 relationships view: each joined community's §7.2.2 relationship
+    /// state. Populated by the loop (not `sync_from_config`, which is synchronous
+    /// and cannot read the async store), so it is left untouched here.
+    pub tsp_relationships: TspRelationshipsState,
+}
+
+/// The TSP Rev 3 relationships pane: one row per joined community, showing the
+/// state of the §7.2.2 relationship the joining persona holds with its VTC.
+///
+/// Deliberately distinct from [`RelationshipsState`], which is the DIDComm
+/// pairwise model. This one is read-only status: the relationships are formed and
+/// answered automatically by the protocol layer (`openvtc_core::tsp` on send,
+/// the SDK's transport adapter on receive), and this view is the window onto
+/// whether each community connection is `None` / `Pending` / `Bidirectional`.
+#[derive(Clone, Debug, Default)]
+pub struct TspRelationshipsState {
+    /// One row per joined community, recomputed by the loop from the durable
+    /// store whenever a relationship changes.
+    pub rows: Arc<[TspRelationshipRow]>,
+    /// Cursor into `rows`.
+    pub selected_index: usize,
+}
+
+/// One community's TSP relationship, as shown in the pane.
+#[derive(Clone, Debug)]
+pub struct TspRelationshipRow {
+    /// Human label for the community (its name, or a short DID tail).
+    pub community_label: String,
+    /// The community's VTC DID — the peer VID of the relationship (`their_vid`).
+    pub vtc_did: String,
+    /// The persona that joined, whose VID is our side of the relationship
+    /// (`our_vid`).
+    pub persona_did: String,
+    /// The relationship state, already rendered for display
+    /// (`None` / `Pending` / `Invite received` / `Bidirectional`).
+    pub state: String,
+    /// Whether the relationship is fully established (drives the row colour).
+    pub established: bool,
+}
+
+// ****************************************************************************
+// Capabilities State
+// ****************************************************************************
+
+/// Load phase of the capabilities view. The reply arrives asynchronously
+/// over DIDComm; `Loading` carries the send instant so the loop's sweep can
+/// fail the query closed after the reply window.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CapabilitiesPhase {
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+/// The capabilities view for one selected community. `None` in
+/// [`CapabilitiesState::view`] means the Communities panel renders normally.
+#[derive(Clone, Debug)]
+pub struct CapabilitiesView {
+    /// Community (VTC) whose capabilities are shown.
+    pub vtc_did: String,
+    /// Persona the queries are sent as.
+    pub persona: openvtc_core::config::account::PersonaId,
+    /// Display name for the header.
+    pub community_name: String,
+    pub phase: CapabilitiesPhase,
+    pub items: Vec<openvtc_core::capabilities::CapabilitySummary>,
+    pub selected: usize,
+    /// Detail view open for the selected capability.
+    pub detail: bool,
+    /// When `Some(index)`, an enable/disable of that capability awaits
+    /// `y`/`⏎` confirmation.
+    pub confirm_toggle: Option<usize>,
+    /// threadId of the in-flight request (list or toggle).
+    pub pending_thid: Option<String>,
+    /// When the in-flight request was sent (reply-timeout sweep).
+    pub sent_at: Option<std::time::Instant>,
+    /// Transient status message.
+    pub status_message: Option<String>,
+}
+
+impl CapabilitiesView {
+    pub fn new(
+        vtc_did: String,
+        persona: openvtc_core::config::account::PersonaId,
+        community_name: String,
+    ) -> Self {
+        Self {
+            vtc_did,
+            persona,
+            community_name,
+            phase: CapabilitiesPhase::Loading,
+            items: Vec::new(),
+            selected: 0,
+            detail: false,
+            confirm_toggle: None,
+            pending_thid: None,
+            sent_at: None,
+            status_message: None,
+        }
+    }
+}
+
+/// Wrapper so `ContentPanelState` stays `Default`-derivable.
+#[derive(Clone, Debug, Default)]
+pub struct CapabilitiesState {
+    pub view: Option<CapabilitiesView>,
+}
+
+// ****************************************************************************
+// Communities State (R-C-*)
+// ****************************************************************************
+
+/// State for the Communities overview panel — the account's community
+/// memberships, in display order (favourites first).
+#[derive(Clone, Debug, Default)]
+pub struct CommunitiesState {
+    /// Display summaries of the (non-archived) communities, in display order.
+    /// `Arc<[…]>` so cloning the panel state (per frame / per event) is a
+    /// pointer bump rather than a deep copy; rebuilt wholesale in
+    /// `sync_from_config`.
+    pub items: Arc<[CommunitySummary]>,
+    /// Joins still being gathered for — vetting applications that have not
+    /// become a membership yet — listed under the memberships in a "Joining"
+    /// section. See [`JoiningSummary`] for what qualifies.
+    pub joining: Arc<[JoiningSummary]>,
+    /// Currently selected row. Indexes [`Self::items`] first and then
+    /// [`Self::joining`], so `items.len() + i` is joining row `i`: one cursor
+    /// walks the whole panel, and every membership key — which acts on an
+    /// index into `items` — finds no membership under a joining row and stays
+    /// inert there, rather than each key needing its own section check.
+    pub selected_index: usize,
+    /// Number of communities raising the actions-required indicator (R-C-3).
+    pub actions_required: usize,
+    /// Transient status message.
+    pub status_message: Option<String>,
+    /// When `Some(index)`, a removal of that community is awaiting `y`/`n`
+    /// confirmation (the panel shows a prompt and other keys are suppressed).
+    pub confirm_delete: Option<usize>,
+    /// When `Some(index)`, leaving that community is awaiting `y`/`n`
+    /// confirmation (R-L-1).
+    pub confirm_leave: Option<usize>,
+    /// When `Some(index)`, cancelling that community's pending join is awaiting
+    /// `y`/`n` confirmation. Transitions the record to `Withdrawn` so it can then
+    /// be deleted or re-joined.
+    pub confirm_withdraw: Option<usize>,
+    /// Whether archived communities are included in the list (R-C-8). Off by
+    /// default; toggled so archived records stay discoverable.
+    pub show_archived: bool,
+    /// Communities (VTC DIDs) whose delivered credential is being verified
+    /// off the loop. Display state only: the membership stays Pending until the
+    /// check finishes, and its row says "verifying…" meanwhile.
+    pub verifying: std::collections::HashSet<String>,
+    /// The personhood challenge this member is part-way through answering, if
+    /// any. `Some` between the community's challenge reply arriving and the
+    /// assertion being sent or the challenge lapsing.
+    ///
+    /// Deliberately **not** persisted to the account. The challenge is
+    /// single-use with a ten-minute life, so a copy surviving a restart could
+    /// only ever be a stale one — and showing a member a match code the
+    /// community has already forgotten is worse than showing none.
+    pub personhood_challenge: Option<PersonhoodChallengeView>,
+    /// Choosing which witness credentials a personhood assertion presents, while it is open.
+    /// `None` otherwise — and every assertion starts with none chosen.
+    pub personhood_evidence: Option<PersonhoodEvidenceView>,
+    /// Deleting one membership's context: the VTA's preview, the typed
+    /// confirmation, then the delete. `None` when nothing is being deleted.
+    pub context_delete: Option<ContextDeleteView>,
+    /// Device access for one membership's context, while it is open.
+    pub device_access: Option<DeviceAccessView>,
+    /// Device grants per context id, as last read from the VTA. Kept across
+    /// `sync_from_config`, which rebuilds only `items`, so the detail block
+    /// shows them without a read per keystroke.
+    pub device_grants: HashMap<String, GrantListing>,
+}
+
+/// A context deletion in progress, for one membership.
+///
+/// The membership is named by community and persona rather than by display
+/// index: the list can re-sort while the VTA is answering, and an index would
+/// then point at a different community.
+#[derive(Clone, Debug)]
+pub struct ContextDeleteView {
+    pub vtc_did: String,
+    pub persona: PersonaId,
+    /// The community's name, for the heading.
+    pub community: String,
+    /// The context being deleted.
+    pub context_id: String,
+    /// The persona deleted along with the context — its keys are there and
+    /// this membership was its only use — and with it the membership record.
+    pub takes_persona: Option<PersonaTakenAlong>,
+    pub phase: ContextDeletePhase,
+    /// What has been typed towards the confirmation.
+    pub typed: String,
+}
+
+impl ContextDeleteView {
+    /// The deletion this view was opened for.
+    #[must_use]
+    pub fn deletion(&self) -> ContextDeletion {
+        ContextDeletion {
+            context_id: self.context_id.clone(),
+            persona: self.takes_persona.clone(),
+        }
+    }
+}
+
+/// Where a [`ContextDeleteView`] is.
+#[derive(Clone, Debug)]
+pub enum ContextDeletePhase {
+    /// Asking the VTA what the delete would remove.
+    Previewing,
+    /// Showing what would be removed and waiting for the typed confirmation.
+    Ready(ContextDeletionPreview),
+    /// The delete is running; input is locked.
+    Deleting,
+}
+
+/// A context's device grants, as far as they are known.
+#[derive(Clone, Debug)]
+pub enum GrantListing {
+    /// Being read for the first time.
+    Loading,
+    /// As the VTA last answered.
+    Loaded(Vec<DeviceGrant>),
+    /// The VTA could not be asked, and why.
+    Failed(String),
+}
+
+impl GrantListing {
+    /// The grants, when they are known.
+    #[must_use]
+    pub fn grants(&self) -> &[DeviceGrant] {
+        match self {
+            GrantListing::Loaded(grants) => grants,
+            GrantListing::Loading | GrantListing::Failed(_) => &[],
+        }
+    }
+}
+
+/// Device access for one membership's context.
+///
+/// Named by context rather than by display index, for the same reason as
+/// [`ContextDeleteView`]: grants belong to the context, and the list can
+/// re-sort while a request runs.
+#[derive(Clone, Debug)]
+pub struct DeviceAccessView {
+    /// The community's name, for the heading and the grant label.
+    pub community: String,
+    /// The context grants are scoped to.
+    pub context_id: String,
+    /// Whether new grants may be made. Only a live membership takes them; a
+    /// finished one's grants can still be read and revoked.
+    pub can_grant: bool,
+    /// Highlighted grant.
+    pub selected: usize,
+    /// The new-grant form, while open.
+    pub form: Option<GrantForm>,
+    /// Revocation of the highlighted grant is armed.
+    pub confirm_revoke: bool,
+    /// A read, grant or revoke is running.
+    pub busy: bool,
+    /// The last result or problem.
+    pub message: Option<String>,
+}
+
+/// The new-grant form.
+#[derive(Clone, Debug)]
+pub struct GrantForm {
+    /// The device's `did:key`, as typed or pasted.
+    pub did: String,
+    /// A name for the device, used in the grant's label.
+    pub name: String,
+    /// Index into [`openvtc_core::community_access::EXPIRY_CHOICES`].
+    pub expiry: usize,
+    /// Focused field: 0 = DID, 1 = name, 2 = expiry.
+    pub field: usize,
+}
+
+impl GrantForm {
+    /// How many fields the form has.
+    pub const FIELDS: usize = 3;
+}
+
+impl Default for GrantForm {
+    fn default() -> Self {
+        Self {
+            did: String::new(),
+            name: String::new(),
+            expiry: DEFAULT_EXPIRY,
+            field: 0,
+        }
+    }
+}
+
+/// A live personhood challenge, as the panel shows it.
+#[derive(Clone, Debug)]
+pub struct PersonhoodChallengeView {
+    /// Which membership it belongs to. A member may hold several, and a
+    /// challenge minted for one community means nothing to another.
+    pub vtc_did: String,
+    pub persona: openvtc_core::config::account::PersonaId,
+    /// The nonce the presentation must carry.
+    pub challenge_id: uuid::Uuid,
+    /// The eight characters to read aloud, derived from `challenge_id`.
+    pub match_code: String,
+    /// When the community stops accepting a presentation for it.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The witness credentials a personhood assertion could present, and which the member has
+/// chosen. Built afresh for each assertion with **nothing** chosen: a VWC discloses a
+/// relationship to the community, so each one is the member's decision, never a default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersonhoodEvidenceView {
+    pub choices: Vec<WitnessChoice>,
+    /// Parallel to `choices`.
+    pub chosen: Vec<bool>,
+    pub cursor: usize,
+    /// "Include all" was asked for and waits on its own confirmation. Never set by anything but
+    /// that request, and cleared by any answer but `y`.
+    pub confirm_all: bool,
+    /// Why the last key did nothing (a selection over the community's limit, say).
+    pub notice: Option<String>,
+}
+
+impl PersonhoodEvidenceView {
+    /// The session ids chosen, in list order.
+    pub fn selected(&self) -> Vec<String> {
+        self.choices
+            .iter()
+            .zip(&self.chosen)
+            .filter(|(_, chosen)| **chosen)
+            .map(|(c, _)| c.session_id.clone())
+            .collect()
+    }
+}
+
+/// One witnessed relationship of the persona, as the picker shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WitnessChoice {
+    /// The witnessing's session id — how the selection names it.
+    pub session_id: String,
+    /// The witness: its verified agent name, else its DID.
+    pub witness: String,
+    /// The other party: the contact's alias or verified name, else their DID.
+    pub counterparty: String,
+    pub witnessed_at: String,
+    /// The VWC's digest, which the community will see.
+    pub digest: String,
+}
+
+impl PersonhoodChallengeView {
+    /// Whether the community would still accept a presentation for this.
+    ///
+    /// The panel checks at render time rather than on a timer: a lapsed
+    /// challenge should stop offering to be answered the moment a person looks
+    /// at it, and the alternative — a countdown task per challenge — is state
+    /// to keep in sync for no gain.
+    pub fn is_live(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        now < self.expires_at
+    }
+}
+
+/// Quick community-switcher overlay state (R-C-7). `Some` while the Ctrl+K popup
+/// is open; it lists the **Active** communities (the only switchable ones) and
+/// owns all key input until dismissed.
+#[derive(Clone, Debug, Default)]
+pub struct CommunitySwitcherState {
+    /// Active communities, in display order (favourites first).
+    pub items: Vec<SwitcherItem>,
+    /// Highlighted entry.
+    pub selected: usize,
+}
+
+/// "Create a new persona DID" overlay. `Some` while open; floats over the main
+/// page like the switcher. Walks `Label` (enter a label) → `Path` (where the DID
+/// lives on the host) → `Working` (the VTA mint runs) → `Done` (show + copy the
+/// DID) or `Failed`. The minted persona is standalone (orphan) — handing its DID
+/// to a VTC lets the VTC issue a VIC bound to it, which a later join then
+/// redeems on the clean join-as-subject path.
+///
+/// Which VTA context holds the persona's keys is **not** a step: every persona
+/// gets a sub-context of its own, named from its label. It was a question with
+/// one sensible answer, asked of someone who had just been told what a `did:webvh`
+/// path is — and answering it any other way gives up the isolation the
+/// sub-context exists for.
+#[derive(Clone, Debug, Default)]
+pub struct CreatePersonaState {
+    /// Which step of the overlay is showing.
+    pub phase: CreatePersonaPhase,
+    /// Label/username input, used while in the `Label` phase.
+    pub label: tui_input::Input,
+    /// Whether the DID's path on the hosting server is the server's to choose
+    /// or the operator's to type (`Path` phase).
+    pub path_choice: PersonaPathChoice,
+    /// The path typed for [`PersonaPathChoice::Custom`]. Kept across a toggle
+    /// back to `Auto`, so glancing at the other row does not lose it.
+    pub path: tui_input::Input,
+    /// Progress / error lines shown in the `Working` and `Failed` phases.
+    pub messages: Vec<String>,
+    /// The minted persona's DID to hand out, set in the `Done` phase: its
+    /// `did:webvh`, or a did:scid's DID URL with `?src=`.
+    pub did: Option<String>,
+    /// Whether [`did`](Self::did) was copied to the clipboard.
+    pub copied: bool,
+    /// How the persona is presented (`Path` phase): `None` takes the account's
+    /// preference (VTI-VTA-036).
+    pub did_method: Option<vta_sdk::did_scid::DidMethod>,
+}
+
+/// "Manage agent names" overlay for a persona. `Some` while open; floats over
+/// the main page. Lists the persona's names (parked ones included), and claims /
+/// parks / resumes / removes them via the VTA's agent-name Trust Tasks. The
+/// registry is authoritative — it is (re)fetched after every mutation, so what
+/// the overlay shows is what the host actually holds.
+#[derive(Clone, Debug, Default)]
+pub struct AgentNameManagerState {
+    /// The persona whose names are being managed.
+    pub persona_did: String,
+    /// The persona's label, for the overlay title.
+    pub persona_label: String,
+    /// The persona's domain-derived host (`example.com`), so the overlay can
+    /// show the full name a local part will bind to. Empty if underivable.
+    pub host: String,
+    /// Current registry entries (name, enabled/parked, created-at). Empty until
+    /// the first list completes.
+    pub names: Vec<AgentNameRow>,
+    /// Selected row in [`names`](Self::names), for park/resume/remove.
+    pub selected: usize,
+    /// New-name input (local part), used to claim a name.
+    pub input: tui_input::Input,
+    /// What the overlay is doing right now (input locked while `Working`).
+    pub phase: AgentNameManagerPhase,
+    /// Transient status / error line.
+    pub message: Option<String>,
+    /// The registry could not be read, so [`names`](Self::names) is not known to
+    /// be the host's current answer.
+    ///
+    /// Only the empty case is actually dangerous, and it is why this flag
+    /// exists: a claim that succeeded and a reload that then failed left the
+    /// overlay rendering "No agent names yet." directly above "Applied, but
+    /// could not reload the list" — the two lines contradict each other, and the
+    /// prominent one says the opposite of what happened. The name was claimed,
+    /// and the DID document proved it.
+    pub list_stale: bool,
+    /// Armed remove confirmation: `Some(row)` while awaiting `y`/Enter to
+    /// release that name (a destructive op — the name becomes free for anyone to
+    /// reclaim). Any other key cancels. `None` when nothing is armed.
+    pub confirm_remove: Option<usize>,
+}
+
+/// One agent-name registry row shown in the manager overlay.
+#[derive(Clone, Debug)]
+pub struct AgentNameRow {
+    /// Local part, without the `@`.
+    pub name: String,
+    /// Whether it currently resolves (`false` = parked, still reserved).
+    pub enabled: bool,
+}
+
+/// What the [`AgentNameManagerState`] overlay is doing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AgentNameManagerPhase {
+    /// Fetching the registry (initial open or post-mutation refresh).
+    #[default]
+    Loading,
+    /// Idle — showing the list, accepting input and row actions.
+    Ready,
+    /// A mutation or check is running; input and actions are locked.
+    Working,
+}
+
+/// Step of the [`CreatePersonaState`] overlay.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CreatePersonaPhase {
+    /// Awaiting the persona label (text input).
+    #[default]
+    Label,
+    /// Where the DID sits on the hosting server. The server allocates a random
+    /// path unless the operator asks (`p`) to type one.
+    Path,
+    /// The VTA mint sequence is running (input locked).
+    Working,
+    /// The persona was minted; show the DID + copy affordance.
+    Done,
+    /// The mint failed; show the error.
+    Failed,
+}
+
+/// Who names the new persona's DID path on the hosting server.
+///
+/// The DID's last components are that path: `did:webvh:{SCID}:host:alice` is
+/// hosted at `host/alice/did.jsonl`. Left to the server it is a fresh random
+/// mnemonic, which is unguessable and says nothing; typed, it is a name the
+/// operator can hand out and recognise — at the cost of being a name, so it can
+/// already be taken and it is public forever.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PersonaPathChoice {
+    /// The hosting server allocates the path (`WebvhPathMode::AutoAssign`).
+    /// The default, and what every persona minted before this choice existed
+    /// got.
+    #[default]
+    Auto,
+    /// The operator types it (`WebvhPathMode::Explicit`).
+    Custom,
+}
+
+/// One entry in the community switcher overlay.
+#[derive(Clone, Debug)]
+pub struct SwitcherItem {
+    /// The community's VTC DID — half of the switch target.
+    pub vtc_did: openvtc_core::config::account::VtcDid,
+    /// The presented persona — the other half of the target, since a community
+    /// may hold more than one membership.
+    pub persona_ref: openvtc_core::config::account::PersonaId,
+    /// Display name (resolved name, or the shortened VTC DID when unnamed).
+    pub display_name: String,
+    /// The presented persona's label, shown to disambiguate multiple memberships
+    /// of the same community.
+    pub persona_label: String,
+    /// Whether this is the current working membership.
+    pub is_current: bool,
+}
+
+/// Why a membership ended, worded for the community detail block (issue #240).
+///
+/// Built only for the terminal states a community drives — `Rejected` and
+/// `Removed` — from the record's [`DecisionEvidence`](openvtc_core::config::account::DecisionEvidence).
+/// A terminal record that carries no evidence (an older config, or a path that
+/// gave none) still gets a summary, with [`reason`](Self::reason) reading "no
+/// reason given" rather than being omitted — the absence is the answer.
+#[derive(Clone, Debug)]
+pub struct DecisionSummary {
+    /// The community's stable code for the decision, when it gave one.
+    pub code: Option<String>,
+    /// The stated reason, or "no reason given" when the community gave none.
+    pub reason: String,
+    /// The deciding authority, shortened for display. A removal notice names the
+    /// administrator; a join rejection names no verifiable authority, so `None`.
+    pub decided_by: Option<String>,
+    /// When the decision was taken, formatted; `None` when none travelled.
+    pub decided_at: Option<String>,
+    /// How our published record was handled on removal; `None` for a rejection.
+    pub disposition: Option<String>,
+}
+
+/// A join in progress, for the Communities panel's "Joining" section: a
+/// vetting application this account is gathering statements for, before any
+/// membership exists to show it.
+///
+/// Without it an applicant opened Communities to an empty page claiming they
+/// had joined nothing — true, but it read as though nothing were happening
+/// while they were part-way through being vetted for one. The application
+/// itself lives on the Vetting page; this row says where it stands and takes
+/// the holder there.
+#[derive(Clone, Debug)]
+pub struct JoiningSummary {
+    /// The application's local handle — what Enter opens.
+    pub application_id: String,
+    /// The community's name, or its shortened DID.
+    pub community_name: String,
+    /// The accent colour the community publishes in its manifest's branding.
+    pub accent: Option<(u8, u8, u8)>,
+    /// The persona the application joins as, labelled as the membership rows
+    /// label theirs.
+    pub persona_label: String,
+    /// Where the application stands, in words: statements counted against
+    /// what the community requires, and what happens next.
+    pub standing: String,
+    /// The published requirements are met — the holder can submit the join.
+    pub ready: bool,
+}
+
+/// Lightweight display summary of a community membership (no Arc/Mutex).
+#[derive(Clone, Debug)]
+pub struct CommunitySummary {
+    /// Display name (resolved name, or the VTC DID when unnamed).
+    pub display_name: String,
+    /// The community signed a credential it issued to this membership with a
+    /// post-quantum key as well as a classical one.
+    pub post_quantum: bool,
+    /// The community proves vetting with a PCS zero-knowledge proof: it learns
+    /// that enough vetters vouched for an applicant, not who they were.
+    pub pcs_zkp: bool,
+    /// Human-readable membership status (e.g. "Active", "Pending", "Left").
+    pub status_label: String,
+    /// Label of the persona presented to this community.
+    pub persona_label: String,
+    /// Member-since date (when Active), formatted; empty otherwise.
+    pub member_since: String,
+    /// Whether the user has starred this community (R-C-4).
+    pub favourite: bool,
+    /// Whether the membership is Active — the only state you can leave (R-L-1)
+    /// or set as the working context (R-C-6).
+    pub is_active: bool,
+    /// Whether the membership is inactive (Left/Withdrawn/Rejected/Removed/
+    /// Expired) — the only states that can be archived or deleted, and rendered
+    /// read-only (D14).
+    pub is_inactive: bool,
+    /// Whether the membership is `Pending` — the only state whose join can be
+    /// cancelled (withdrawn).
+    pub is_pending: bool,
+    /// Whether this is a `Pending` join the VTC hasn't acknowledged within the
+    /// grace window — the submit may have been dropped rather than healthily
+    /// awaiting a decision. Drives a warning hint on the row (D16).
+    pub pending_unacknowledged: bool,
+    /// Whether this is a `Pending` join the VTC approved whose membership
+    /// credential has not arrived. Drives its own hint on the row, and is the
+    /// one non-Active state `R` (renew) is offered for: the manual rescue for a
+    /// lost credential delivery.
+    pub approved_awaiting_credential: bool,
+    /// For such a join, what the community last said about re-delivering the
+    /// credential, worded for the row. `None` when it has said nothing.
+    pub credential_resend_note: Option<String>,
+    /// For such a join, why the last credential the community delivered was
+    /// refused. `Some` means it arrived — the fault is in the credential, not
+    /// the delivery.
+    pub credential_refused: Option<String>,
+    /// Which transport carried the join submit, when the record knows.
+    ///
+    /// Only used to qualify the unacknowledged warning. Without it the warning
+    /// reads the same whether the community ignored us or could not decode the
+    /// transport it advertised, which is the ambiguity that made a real failure
+    /// take a night to find. `None` for records written before it was recorded.
+    pub submit_transport: Option<String>,
+    /// Whether this community is archived (R-C-8); only shown when "show archived"
+    /// is on, with a marker.
+    pub archived: bool,
+    /// Whether this community raises the actions-required indicator (R-C-3).
+    pub needs_attention: bool,
+    /// Full persona `did:webvh` presented to this community (troubleshooting
+    /// detail). Empty if the `persona_ref` dangles.
+    pub persona_did: String,
+    /// Verified agent name for [`Self::persona_did`], if it has one.
+    ///
+    /// Shown on its own row *above* the DID rather than replacing it: the
+    /// troubleshooting block's DID rows are what you read and copy when
+    /// diagnosing, so the DID stays put and the name is added alongside.
+    pub persona_agent_name: Option<String>,
+    /// The community's VTC `did:webvh` (troubleshooting detail).
+    pub vtc_did: String,
+    /// Verified agent name for [`Self::vtc_did`], if it has one.
+    pub vtc_agent_name: Option<String>,
+    /// The per-community sub-context id (troubleshooting detail).
+    pub sub_context_id: String,
+    /// How far that context keeps this community apart from the others.
+    pub context_note: String,
+    /// Whether [`Self::sub_context_id`] is a sub-context of the account's own
+    /// rather than the top context — the only kind whose device access is
+    /// scoped to this community, and the only kind that can be deleted.
+    pub has_own_context: bool,
+    /// The join request id while `Pending`; empty otherwise.
+    pub request_id: String,
+    /// Whether the membership credential (VMC) has been received + stored.
+    pub has_membership_credential: bool,
+    /// Whether the role credential (a community VAC) has been received.
+    pub has_role_credential: bool,
+    /// The roles that credential confers (`role:<name>` actions), for display.
+    pub role_names: Vec<String>,
+    /// One line per stored credential set aside on load because it pre-dates
+    /// DTG Credentials v1 ([`openvtc_core::config::account::RetiredCredential`]).
+    /// Shown as a warning with what to do about it.
+    pub retired_credentials: Vec<String>,
+    /// The accent colour the community publishes in its manifest's branding.
+    pub accent: Option<(u8, u8, u8)>,
+    /// Why the membership ended, for a `Rejected`/`Removed` row (issue #240).
+    /// `None` for every other state.
+    pub decision: Option<DecisionSummary>,
+}
+
+// ****************************************************************************
+// Personas State — the holder's own identity
+// ****************************************************************************
+
+/// Which part of the identity story the pane is showing.
+///
+/// The order is the story: who I am, what I know about myself, what I choose to
+/// show, and who sees which of it. Every tab after the first depends on the one
+/// before it, so a holder who reads them in order never meets a term that has
+/// not been introduced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PersonaTab {
+    /// The persona DIDs themselves — a persona as an *identity*.
+    #[default]
+    Personas,
+    /// The attribute pool: the attributes, held once.
+    Attributes,
+    /// Named projections over the pool.
+    Profiles,
+    /// The worlds: parts of a life, and the projections that belong to them.
+    Worlds,
+    /// Which persona each community sees, and what it presents there.
+    Communities,
+    /// What has actually left, and to whom.
+    Disclosures,
+}
+
+impl PersonaTab {
+    /// Every tab, in display order.
+    #[must_use]
+    pub fn all() -> [PersonaTab; 6] {
+        [
+            PersonaTab::Personas,
+            PersonaTab::Attributes,
+            PersonaTab::Profiles,
+            PersonaTab::Worlds,
+            PersonaTab::Communities,
+            PersonaTab::Disclosures,
+        ]
+    }
+
+    /// The tab's name in the header strip — the words a person reads, which are
+    /// not the words the code and the wire use
+    /// (`design-docs/persona-vocabulary.md`).
+    ///
+    /// The variants keep the spec's nouns because that is what they address:
+    /// `Profiles` is `persona/profile/*`. The screen says *Faces*, because
+    /// "profile" already means three things in this product and "my LinkedIn
+    /// page" to everyone else; `Worlds` is `persona/world/*` and the screen
+    /// says *Worlds*, because nobody says "my work world" to a friend.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            PersonaTab::Personas => "Personas",
+            PersonaTab::Attributes => "Your attributes",
+            PersonaTab::Profiles => "Faces",
+            PersonaTab::Worlds => "Worlds",
+            PersonaTab::Communities => "Communities",
+            PersonaTab::Disclosures => "What has left",
+        }
+    }
+
+    /// Whether this tab's contents come from the agent rather than `Config`.
+    ///
+    /// Drives which tabs a refresh has anything to do, and which can draw
+    /// before the agent has ever answered. Personas are local: an account with no
+    /// VTA session still has personas, and a pane that showed nothing until the
+    /// network answered would be lying about the ones on disk.
+    #[must_use]
+    pub fn needs_agent(self) -> bool {
+        matches!(
+            self,
+            PersonaTab::Attributes
+                | PersonaTab::Profiles
+                | PersonaTab::Worlds
+                | PersonaTab::Communities
+                | PersonaTab::Disclosures
+        )
+    }
+
+    #[must_use]
+    pub fn next(self) -> PersonaTab {
+        match self {
+            PersonaTab::Personas => PersonaTab::Attributes,
+            PersonaTab::Attributes => PersonaTab::Profiles,
+            PersonaTab::Profiles => PersonaTab::Worlds,
+            PersonaTab::Worlds => PersonaTab::Communities,
+            PersonaTab::Communities => PersonaTab::Disclosures,
+            PersonaTab::Disclosures => PersonaTab::Personas,
+        }
+    }
+
+    #[must_use]
+    pub fn prev(self) -> PersonaTab {
+        match self {
+            PersonaTab::Personas => PersonaTab::Disclosures,
+            PersonaTab::Attributes => PersonaTab::Personas,
+            PersonaTab::Profiles => PersonaTab::Attributes,
+            PersonaTab::Worlds => PersonaTab::Profiles,
+            PersonaTab::Communities => PersonaTab::Worlds,
+            PersonaTab::Disclosures => PersonaTab::Communities,
+        }
+    }
+}
+
+/// One community membership, as the Communities tab needs it: which persona this
+/// community sees, and enough to look up what that persona presents.
+#[derive(Clone, Debug, Default)]
+pub struct PersonaMembership {
+    /// Display name of the community.
+    pub community_name: String,
+    /// The VTA context the binding lives in.
+    pub sub_context_id: String,
+    /// The persona DID this community sees.
+    pub persona_did: String,
+    /// The holder's label for that persona (or its agent name / DID).
+    pub persona_label: String,
+    /// Membership lifecycle, already worded for display.
+    pub status_label: String,
+    /// How many *other* communities are shown this same persona.
+    ///
+    /// The linkage number. Two communities shown one persona can compare notes and
+    /// discover they are talking to the same person, which is the single most
+    /// consequential fact about a persona arrangement and the one a holder
+    /// cannot recompute by looking at one row.
+    pub shared_with: usize,
+}
+
+/// A confirmation the pane is waiting on. One at a time, because the panel has
+/// one prompt line and a holder answering `y` must never be able to wonder
+/// which question they answered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PersonaConfirm {
+    #[default]
+    None,
+    /// Remove an orphan persona DID (index into `personas`).
+    ///
+    /// The one variant still addressed by index, because it hands off to the
+    /// existing identity-deletion path, which takes one and re-resolves the DID
+    /// under its own guards before anything is removed.
+    DeletePersona(usize),
+    /// Delete a pool attribute, named by what it is rather than by where it sat.
+    ///
+    /// **Not an index.** An armed question survives across a listing that
+    /// arrives while it is on screen, and an index into the old listing points
+    /// at a different attribute in the new one — which would delete something
+    /// the operator never selected while showing them the name of something
+    /// else. The name is carried for the same reason: the prompt has to name
+    /// what was armed, not whatever now occupies that row.
+    ///
+    /// `cascade` is decided when the question is put, from the profile listing
+    /// the pane already holds: the VTA refuses a plain delete while a profile
+    /// references the attribute, so cascading is what will actually happen and
+    /// the prompt says so the first time.
+    DeleteAttribute {
+        attribute_id: String,
+        name: String,
+        cascade: bool,
+    },
+    /// Delete a profile. Named, not indexed, for the reason above.
+    ///
+    /// `unbind` is the same decision one layer up: it makes every persona
+    /// presenting under this profile present nothing, and it is decided from
+    /// the binding map rather than discovered from a refusal — except where
+    /// the map cannot see: a persona outside this account's memberships. That
+    /// refusal re-asks with `unbind` set (`PersonaOutcome::ProfileWorn`).
+    DeleteProfile {
+        profile_id: String,
+        name: String,
+        unbind: bool,
+        /// "disclosed to N parties … deleting does not un-tell them", once the
+        /// agent has said how far the face has spoken. `None` while unknown, or
+        /// when it told no one.
+        untell: Option<String>,
+    },
+    /// Retire a face: taken off every community it is worn in, kept with its
+    /// values and history, out of every picker until reinstated. `worn` is how
+    /// many places it is worn now, so the prompt can say what it takes off.
+    RetireFace {
+        profile_id: String,
+        name: String,
+        worn: usize,
+    },
+    /// Delete a world. Named, not indexed, for the reason above.
+    ///
+    /// `faces` is how many faces belong to it now, so the prompt can say what
+    /// will *not* happen: a world arranges, it does not contain, and "delete
+    /// Work" reads to almost everyone as though the faces in it go too. The
+    /// count is resolved against the face list rather than taken from the
+    /// record, so it is the number the holder can see on screen.
+    DeleteWorld {
+        world_id: String,
+        name: String,
+        expected_version: Option<u64>,
+        faces: usize,
+    },
+    /// Forget the earlier versions of one attribute.
+    ///
+    /// Named, not indexed, for the reason above. `used_by` is how many faces
+    /// use the attribute at all — the listing does not say which of them pin an
+    /// old version, so the prompt names the faces at risk rather than claiming
+    /// a number it cannot know. How many pins actually went stale comes back
+    /// from the purge itself and is reported then.
+    PurgeAttribute {
+        attribute_id: String,
+        name: String,
+        used_by: usize,
+    },
+    /// Clear what one persona presents in one context — the pair the binding is
+    /// addressed by, carried whole for the same reason as above.
+    Unbind {
+        context_id: String,
+        persona_did: String,
+        community: String,
+    },
+}
+
+/// The people one community has told the holder about — and, when one is open,
+/// what they said.
+///
+/// The mirror of the Disclosures tab: that is what left, this is what arrived.
+/// Both live per community, because a contact is filed in the context it was
+/// received in and against the persona that received it.
+#[derive(Clone, Debug, Default)]
+pub struct PeopleView {
+    pub context_id: String,
+    pub community: String,
+    /// The persona the holder is in this community — what a new contact is
+    /// filed against.
+    pub persona_did: String,
+    pub contacts: Option<Result<Vec<openvtc_core::persona::contacts::ContactSummary>, String>>,
+    pub selected: usize,
+    /// One contact read in full, with what they said before.
+    pub open: Option<Result<openvtc_core::persona::contacts::ContactDetail, String>>,
+    /// The "record what they told you" form, when it is up.
+    pub form: Option<ContactForm>,
+    /// A delete armed against a named contact, never an index.
+    pub deleting: Option<(String, String)>,
+    pub working: bool,
+    pub error: Option<String>,
+}
+
+/// Making a face that lives inside one community.
+///
+/// Inline values only, and that is the boundary rather than a simplification:
+/// a context-local face has nowhere in its wire type to name a pool attribute.
+#[derive(Clone, Debug, Default)]
+pub struct LocalFaceForm {
+    pub name: tui_input::Input,
+    pub rows: Vec<ComposeRow>,
+    /// 0 = the name, then two per row.
+    pub field: usize,
+}
+
+impl LocalFaceForm {
+    /// One empty row, so the form opens with somewhere to type.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rows: vec![ComposeRow::default()],
+            ..Self::default()
+        }
+    }
+
+    /// How many fields the form has.
+    #[must_use]
+    pub fn field_count(&self) -> usize {
+        1 + 2 * self.rows.len()
+    }
+}
+
+/// Recording what someone told the holder about themselves.
+///
+/// Self-asserted by construction: the holder is typing what a peer said, so
+/// nothing here claims a provenance on the peer's behalf.
+#[derive(Clone, Debug, Default)]
+pub struct ContactForm {
+    pub subject_did: tui_input::Input,
+    pub rows: Vec<ComposeRow>,
+    pub notes: tui_input::Input,
+    /// 0 = their DID, then two per row, then the note.
+    pub field: usize,
+}
+
+impl ContactForm {
+    /// One empty row, so the form opens with somewhere to type.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            rows: vec![ComposeRow::default()],
+            ..Self::default()
+        }
+    }
+
+    /// The note field's index — after the DID and two fields per row.
+    #[must_use]
+    pub fn notes_field(&self) -> usize {
+        1 + 2 * self.rows.len()
+    }
+}
+
+/// The formats this agent can produce, and what each one discards.
+///
+/// Read-only. It is here because this client always asks for one renderer
+/// without the holder having chosen it, and what a format drops is the
+/// difference between "my employer attested this" and "they said so".
+#[derive(Clone, Debug, Default)]
+pub struct RenderersView {
+    pub formats: Option<Result<Vec<openvtc_core::persona::disclosure::Renderer>, String>>,
+}
+
+/// Every persona of the holder's that one community has a binding record for.
+///
+/// Read-only, and the point is the count: a community that knows someone under
+/// two personas can put them together, and no other row in this pane says so.
+#[derive(Clone, Debug, Default)]
+pub struct KnownHereView {
+    pub context_id: String,
+    pub community: String,
+    pub personas: Option<Result<Vec<openvtc_core::persona::binding::KnownHere>, String>>,
+}
+
+/// Which field of the attribute editor has the keyboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttributeField {
+    /// The vocabulary token (`email.work`).
+    #[default]
+    ClaimType,
+    /// The holder's own label.
+    Label,
+    /// String / number / boolean / date / object.
+    ValueType,
+    /// The value itself.
+    Value,
+}
+
+impl AttributeField {
+    #[must_use]
+    pub fn next(self) -> AttributeField {
+        match self {
+            AttributeField::ClaimType => AttributeField::Label,
+            AttributeField::Label => AttributeField::ValueType,
+            AttributeField::ValueType => AttributeField::Value,
+            AttributeField::Value => AttributeField::ClaimType,
+        }
+    }
+
+    #[must_use]
+    pub fn prev(self) -> AttributeField {
+        match self {
+            AttributeField::ClaimType => AttributeField::Value,
+            AttributeField::Label => AttributeField::ClaimType,
+            AttributeField::ValueType => AttributeField::Label,
+            AttributeField::Value => AttributeField::ValueType,
+        }
+    }
+}
+
+/// The attribute editor — create when `attribute_id` is `None`, else edit.
+#[derive(Clone, Debug, Default)]
+pub struct AttributeForm {
+    /// The attribute being edited; `None` creates a new one.
+    pub attribute_id: Option<String>,
+    /// The version the form was opened against, sent back as the write's
+    /// precondition so an edit made elsewhere in the meantime is refused rather
+    /// than silently overwritten.
+    pub expected_version: Option<u64>,
+    pub claim_type: tui_input::Input,
+    pub label: tui_input::Input,
+    /// Index into [`VALUE_TYPES`].
+    pub value_type: usize,
+    pub value: tui_input::Input,
+    /// The attribute's endorsements, carried through an edit unchanged.
+    pub endorsements: Vec<String>,
+    pub field: AttributeField,
+    /// Why the last submit did not go through — a parse failure on the value,
+    /// or the VTA's own refusal. Shown against the form, not the list, so the
+    /// holder keeps what they typed.
+    pub error: Option<String>,
+    /// A write is in flight; the form is read-only until it lands.
+    pub working: bool,
+}
+
+/// The value types the editor offers, in the order it cycles them. Mirrors the
+/// SDK's `ValueType`; kept as strings because the form is a UI object and the
+/// conversion belongs at the write, in `persona::pool::value_type_from_str`.
+pub const VALUE_TYPES: [&str; 5] = ["string", "number", "boolean", "date", "object"];
+
+/// Which half of the profile editor has the keyboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProfileFormFocus {
+    #[default]
+    Name,
+    Entries,
+}
+
+/// The profile editor: a name, and a tick-list over the pool.
+#[derive(Clone, Debug, Default)]
+pub struct ProfileForm {
+    /// The profile being edited; `None` creates a new one.
+    pub profile_id: Option<String>,
+    pub expected_version: Option<u64>,
+    pub name: tui_input::Input,
+    /// Attribute ids the holder has ticked, in the order they were ticked —
+    /// which is the order the profile will present them in.
+    pub ticked: Vec<String>,
+    /// Cursor into the pool list.
+    pub cursor: usize,
+    pub focus: ProfileFormFocus,
+    /// Pinned / overridden / inline entries read from the profile, carried here
+    /// so the save writes them back untouched.
+    ///
+    /// This build's editor owns live references and nothing else. Rebuilding
+    /// the profile from only the ticked boxes would delete the other forms the
+    /// first time a holder renamed it, and the deletion would be invisible —
+    /// the profile would still resolve, just to less than it did.
+    pub preserved: Vec<vta_sdk::protocols::persona::ProfileEntry>,
+    /// References the face held to attributes the pool no longer has, left out
+    /// of `ticked` when the editor opened.
+    ///
+    /// The VTA refuses a face that references a missing attribute, so carrying
+    /// them would make every save fail — and they have no row to untick, so the
+    /// holder could not fix it from here. Counted so the editor can say that
+    /// saving drops them, rather than doing so silently.
+    pub dropped: usize,
+    pub error: Option<String>,
+    pub working: bool,
+}
+
+/// The profile picker for one membership: what should this persona present here?
+#[derive(Clone, Debug, Default)]
+pub struct BindPicker {
+    /// The binding this picker will write, named rather than indexed. The
+    /// membership list is rebuilt from `Config` on every sync — an inbound
+    /// message is enough — and an index into the old list would point at a
+    /// different membership in the new one, sending the holder's identity to a
+    /// community they were not looking at.
+    pub context_id: String,
+    pub persona_did: String,
+    /// Display only: who is being shown something, and as whom.
+    pub community: String,
+    pub persona_label: String,
+    /// Cursor over the options, where 0 is always "present nothing" — a
+    /// first-class choice rather than the absence of one, because a persona that
+    /// deliberately shows nothing is a common and legitimate arrangement.
+    pub cursor: usize,
+    pub working: bool,
+    pub error: Option<String>,
+}
+
+/// The editor for one world: its name, its colour, its mark.
+///
+/// Membership is **not** edited here, and the omission is deliberate. A world's
+/// faces are changed from the Faces tab, where the holder can see the face they
+/// are moving; a second membership editor would be a second place to get the
+/// replace semantics of `persona/world/put` wrong. What the form does carry is
+/// the whole membership as read, so that saving a rename puts it back untouched
+/// — the field below is that copy, and it is why this form cannot be built from
+/// nothing.
+#[derive(Clone, Debug, Default)]
+pub struct WorldForm {
+    /// The world being edited; `None` creates a new one.
+    pub world_id: Option<String>,
+    pub expected_version: Option<u64>,
+    pub name: tui_input::Input,
+    /// Cursor into [`Colour::all`](openvtc_core::persona::world::Colour::all).
+    pub colour: usize,
+    /// One or two emoji, or nothing. Optional, and a terminal that cannot draw
+    /// it loses nothing that carries meaning.
+    pub icon: tui_input::Input,
+    pub focus: WorldFormFocus,
+    /// The membership as it was read, written back unchanged.
+    ///
+    /// `put` is a replace: omitting these means *empty them*, not "leave them
+    /// alone". A form that rebuilt the record from its own fields would empty
+    /// the world every time somebody renamed it, and the loss would be silent —
+    /// the world would still be there, just with nothing in it.
+    pub face_ids: Vec<String>,
+    pub attribute_ids: Vec<String>,
+    pub error: Option<String>,
+    pub working: bool,
+}
+
+/// Which field of [`WorldForm`] has the keyboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorldFormFocus {
+    #[default]
+    Name,
+    Colour,
+    Icon,
+}
+
+impl WorldFormFocus {
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Colour,
+            Self::Colour => Self::Icon,
+            Self::Icon => Self::Name,
+        }
+    }
+
+    #[must_use]
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Icon,
+            Self::Colour => Self::Name,
+            Self::Icon => Self::Colour,
+        }
+    }
+}
+
+/// The world picker for one face: which part of your life does this belong to?
+#[derive(Clone, Debug, Default)]
+pub struct FacePlacer {
+    /// The face being moved, named rather than indexed — the face list is
+    /// re-sorted by world on every read, so an index taken before a refresh
+    /// would name a different face afterwards, and this picker's whole job is
+    /// to move a specific one.
+    pub profile_id: String,
+    /// Display only: which face the holder is looking at.
+    pub face_name: String,
+    /// Cursor over the options, where 0 is always "belongs to no world" — a
+    /// first-class choice rather than the absence of one. Every face belonging
+    /// somewhere is fine too, and a picker with no way back out would make a
+    /// world a trap rather than an arrangement.
+    pub cursor: usize,
+    pub working: bool,
+    pub error: Option<String>,
+}
+
+/// What owns the keyboard inside the pane.
+//
+// One variant per screen, each carrying that screen's whole state, so the
+// largest form sets the size of every value. Boxing them to even that out would
+// put an allocation between a keystroke and the field it types into, for a
+// value that lives in one place on the stack and is replaced whole.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Default)]
+pub enum PersonaMode {
+    #[default]
+    View,
+    Attribute(AttributeForm),
+    Profile(ProfileForm),
+    World(WorldForm),
+    PlaceFace(FacePlacer),
+    Bind(BindPicker),
+    Compose(ComposeForm),
+    LocalFaces(LocalFacesView),
+    /// The output formats the agent can produce (read-only).
+    Renderers(RenderersView),
+    /// Who one community knows the holder as (read-only).
+    KnownHere(KnownHereView),
+    /// What people in one community have told the holder about themselves.
+    People(PeopleView),
+}
+
+/// A face made inside a community, named so a question can outlive the
+/// listing it was asked from.
+#[derive(Clone, Debug)]
+pub struct LocalFaceRef {
+    pub profile_id: String,
+    pub name: String,
+}
+
+/// The faces made inside one community, and the one-way step that makes a
+/// value reusable across the holder's faces (`persona/attribute/promote`).
+#[derive(Clone, Debug, Default)]
+pub struct LocalFacesView {
+    /// The persona the holder is in this community — who wears a local face
+    /// when one is worn from here.
+    pub persona_did: String,
+    /// The "make a face here" form, when it is up. Name plus inline values:
+    /// a face made here cannot reach the pool, so there is nothing to tick.
+    pub form: Option<LocalFaceForm>,
+    /// A delete armed against a named face, never an index.
+    pub deleting: Option<(String, String)>,
+    pub context_id: String,
+    pub community: String,
+    /// `None` while being read.
+    pub faces: Option<Result<Vec<openvtc_core::persona::lifecycle::LocalFace>, String>>,
+    /// Index into [`Self::rows`].
+    pub cursor: usize,
+    /// The chosen values: one face, and positions within it. Choosing in a
+    /// second face starts over — a promotion moves one face.
+    pub chosen: Option<(String, Vec<u64>)>,
+    /// The one-way question is on screen; ⏎ again promotes.
+    pub confirming: bool,
+    pub working: bool,
+    pub error: Option<String>,
+}
+
+impl LocalFacesView {
+    /// Every value, as `(face index, entry index)`, in display order.
+    #[must_use]
+    pub fn rows(&self) -> Vec<(usize, usize)> {
+        match &self.faces {
+            Some(Ok(faces)) => faces
+                .iter()
+                .enumerate()
+                .flat_map(|(f, face)| (0..face.entries.len()).map(move |e| (f, e)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The face the cursor is in, whichever of its values the cursor sits on.
+    ///
+    /// Returns its id and name rather than a borrow, so a caller can arm a
+    /// question against what it named while the listing behind it changes.
+    #[must_use]
+    pub fn face_under_cursor(&self) -> Option<LocalFaceRef> {
+        let (f, _) = *self.rows().get(self.cursor)?;
+        let face = match &self.faces {
+            Some(Ok(faces)) => faces.get(f)?,
+            _ => return None,
+        };
+        Some(LocalFaceRef {
+            profile_id: face.profile_id.clone(),
+            name: face.name.clone(),
+        })
+    }
+}
+
+/// One value typed into a face being made for a community.
+#[derive(Clone, Debug, Default)]
+pub struct ComposeRow {
+    pub claim_type: tui_input::Input,
+    pub value: tui_input::Input,
+    /// Use it in the holder's other faces too. Off — the default — it stays in
+    /// this face alone.
+    pub share: bool,
+}
+
+/// Making a face for one community, where it is asked for, and wearing it
+/// there — `persona/profile/compose`. Local by default: nothing typed here
+/// reaches another face unless its row says so.
+#[derive(Clone, Debug, Default)]
+pub struct ComposeForm {
+    pub context_id: String,
+    pub persona_did: String,
+    pub community: String,
+    /// The holder's own name for the face. Never shown to anyone.
+    pub name: tui_input::Input,
+    pub rows: Vec<ComposeRow>,
+    /// 0 is the name; then each row's type and value, in order.
+    pub field: usize,
+    pub error: Option<String>,
+    pub working: bool,
+}
+
+impl ComposeForm {
+    /// The number of fields: the name, and two per row.
+    #[must_use]
+    pub fn field_count(&self) -> usize {
+        1 + 2 * self.rows.len()
+    }
+
+    /// The row the focus is in, when it is not on the name.
+    #[must_use]
+    pub fn focused_row(&self) -> Option<usize> {
+        self.field.checked_sub(1).map(|f| f / 2)
+    }
+}
+
+/// The persona pane: every surface for the holder's own identity, in one place.
+///
+/// Five of the six tabs are served by the agent and one by `Config`, and the
+/// difference is load-bearing rather than incidental. Personas are on disk, so
+/// they draw at launch with no session; the pool, the profiles, the worlds and
+/// the bindings are the agent's, so each of them has to be able to say "I could
+/// not ask" distinctly from "you hold nothing" — see
+/// [`load_error`](Self::load_error).
+#[derive(Clone, Debug, Default)]
+pub struct IdentityState {
+    pub tab: PersonaTab,
+
+    // ── Personas (from `Config`) ────────────────────────────────────────────
+    /// Every persona DID in the account, with how many communities present it.
+    pub personas: Arc<[ManagedDid]>,
+    pub persona_selected: usize,
+
+    // ── Communities (from `Config`, annotated from the agent) ────────────
+    pub memberships: Arc<[PersonaMembership]>,
+    pub membership_selected: usize,
+    /// What each persona presents in each community's context, keyed by
+    /// `(sub_context_id, persona_did)` — the pair `persona/binding/get` is
+    /// addressed by, and the pair every membership row already carries.
+    ///
+    /// **Session state, deliberately not persisted.** The agent-name cache is
+    /// persisted, and the difference is the point: a verified name is a
+    /// property of a DID document that rarely changes and costs a network
+    /// round-trip to establish, so showing it instantly at launch is worth
+    /// keeping on disk. A binding is the holder's own current decision, cheap
+    /// to fetch, and editable from `pnm` at any moment — a persisted copy would
+    /// show what they used to present, on the one surface whose job is to tell
+    /// them what they present now. `prune_agent_name_negatives` already draws
+    /// this line for negatives; this is the same argument applied to the whole
+    /// record.
+    ///
+    /// An absent entry is not "presents nothing" — see
+    /// [`BindingSummary::unknown`](openvtc_core::persona::binding::BindingSummary::unknown).
+    /// Read by the communities panel too, which renders the same fact on its
+    /// own rows; it lives here because this is the pane that changes it.
+    pub bindings: HashMap<(String, String), openvtc_core::persona::binding::BindingSummary>,
+
+    // ── The pool (from the agent) ────────────────────────────────────────
+    pub attributes: Arc<[openvtc_core::persona::pool::PoolAttribute]>,
+    pub attribute_selected: usize,
+    /// Whether the listing asked for values.
+    ///
+    /// Off by default, and it re-reads rather than filtering what it already
+    /// holds: a list fetched without values does not *have* them, which is the
+    /// difference between an opt-in and a blindfold. Toggling it is the
+    /// holder asking to see their own identity, so it is a keypress they make
+    /// on purpose and a network round-trip, not a display flag.
+    pub show_values: bool,
+    /// The one attribute whose value is being shown unmasked, by `attribute_id`.
+    ///
+    /// One, and only while it is also the selected row — the render checks
+    /// both. Sensitivity is a property of the claim type, so a card number and
+    /// a date of birth are masked even in a listing the holder asked to see
+    /// (`openvtc_core::persona::claim_types`), and lifting that is a per-attribute
+    /// act rather than a mode the pane can be left in.
+    ///
+    /// Cleared by moving the selection, changing tab, or a re-read. A reveal
+    /// that outlived the row it was granted for would be a global unmask
+    /// arrived at one keypress at a time.
+    pub revealed_attribute: Option<String>,
+
+    // ── Links (from the agent) ───────────────────────────────────────────
+    /// Where the holder's identities join up, and which joins cross a world.
+    ///
+    /// Read alongside the pool rather than on demand: the answer is computed
+    /// across every attribute at once, so a per-row question would be one
+    /// round-trip each for a page the agent builds in one.
+    ///
+    /// Empty means the agent found nothing *or* does not serve
+    /// `persona/correlation/analyze`. Neither is a failure; a read that failed
+    /// lands in [`load_error`](Self::load_error), because a clean bill of
+    /// health nobody computed is the answer that misleads.
+    pub links: Arc<[openvtc_core::persona::correlation::Finding]>,
+
+    // ── Worlds (from the agent) ──────────────────────────────────────────
+    /// The parts of the holder's life, and which faces belong to them.
+    ///
+    /// Empty is a real answer and means the holder has arranged nothing yet —
+    /// or that the agent predates `persona/world/*`, which amounts to the same
+    /// thing from here, because such a holder cannot have a world to show. A
+    /// read that *failed* lands in [`load_error`](Self::load_error) instead.
+    pub worlds: Arc<[openvtc_core::persona::world::World]>,
+    pub world_selected: usize,
+
+    // ── Profiles (from the agent) ────────────────────────────────────────
+    pub profiles: Arc<[openvtc_core::persona::profile::ProfileSummary]>,
+    pub profile_selected: usize,
+    /// Faces the holder retired — kept, worn nowhere, out of every picker.
+    /// Listed on the Faces tab only when asked for (`z`), so one can be
+    /// brought back; nowhere else.
+    pub retired_faces: Arc<[openvtc_core::persona::profile::ProfileSummary]>,
+    /// Why the retired faces could not be read, shown in that view only: it is
+    /// an optional listing, and must not blank the faces the holder wears.
+    pub retired_error: Option<String>,
+    /// The Faces tab is showing the retired faces.
+    pub show_retired: bool,
+    /// Where the opened face is worn and what it has done (`h`), once read.
+    pub face_history: Option<Result<openvtc_core::persona::lifecycle::FaceHistory, String>>,
+    /// The profile opened with Enter, resolved to what it would present.
+    pub open_profile: Option<openvtc_core::persona::profile::ProfileDetail>,
+    /// The claim under the cursor inside that opened face.
+    ///
+    /// Separate from [`profile_selected`](Self::profile_selected), which keeps
+    /// pointing at the face in the list behind the detail — closing the detail
+    /// has to land back on the face that was opened, so the two cursors cannot
+    /// share a field.
+    pub face_claim_selected: usize,
+    /// The one claim of the opened face being shown unmasked, by index.
+    ///
+    /// The same grant the attributes tab makes, on the same terms: one claim,
+    /// and only while it is also the selected one — the render checks both.
+    /// Indices rather than identifiers because a resolved claim has no id of
+    /// its own to key on (an inline value has no pool attribute behind it), and
+    /// the order is fixed for as long as a detail is open: every path that
+    /// replaces `open_profile` clears this too.
+    pub revealed_face_claim: Option<usize>,
+
+    // ── Disclosures (from the agent) ─────────────────────────────────────
+    /// What has actually left, newest first, across every context.
+    ///
+    /// Read-only, and capped: the record is append-only and unbounded, so the
+    /// pane asks for a page of it rather than all of it. See
+    /// [`crate::state_handler::persona_actions::DISCLOSURE_PAGE`].
+    pub disclosures: Arc<[openvtc_core::persona::disclosure::DisclosureRow]>,
+    pub disclosure_selected: usize,
+
+    // ── Shared ───────────────────────────────────────────────────────────
+    /// The claim-type registry this agent resolves against — how each value is
+    /// shown, and what it takes to let it leave.
+    ///
+    /// Read once per load and held for the session, because it is a constant
+    /// for a given agent. It starts as the compiled copy so the very first
+    /// frame has a table to draw with; the read replaces it, and
+    /// [`Registry::is_fallback`](openvtc_core::persona::claim_types::Registry::is_fallback)
+    /// is what lets the pane say when a masking decision came from a table the
+    /// holder's own agent did not supply.
+    pub claim_types: openvtc_core::persona::claim_types::Registry,
+    /// Whether [`claim_types`](Self::claim_types) is still the compiled copy
+    /// this pane started with.
+    ///
+    /// Separate from `Registry::is_fallback`, which answers a different
+    /// question: that one says *the agent told us it cannot serve the table*,
+    /// this one says *we have not asked yet*. Collapsing them would make a
+    /// refresh re-read a constant, or make a never-asked pane claim its agent
+    /// is old.
+    pub claim_types_loaded: bool,
+    /// The `did:key` this install authenticates to the agent as, when the
+    /// account is agent-managed.
+    ///
+    /// Display-only, and here for one line: the grant hint shown when the agent
+    /// refuses a read names a `pnm acl update` command, and that command needs
+    /// this DID. A placeholder there is a command the reader cannot run — they
+    /// would have to go and find the DID on another pane first, which is the
+    /// step the hint exists to remove.
+    pub agent_credential_did: Option<String>,
+    /// A read is in flight.
+    pub loading: bool,
+    /// Why the last read failed, kept until one succeeds.
+    ///
+    /// An empty pool and an unreachable agent look identical on screen unless
+    /// something says otherwise, and of the two, "you have no attributes" is
+    /// the confident wrong answer about the holder's own data (VTI R6.4).
+    pub load_error: Option<String>,
+    /// Whether the agent-served tabs have ever been read in this session.
+    pub loaded: bool,
+    /// A refresh was asked for while one was in flight. Re-issued when the
+    /// domain frees, rather than dropped: the request that prompted it (a write
+    /// that just landed) is exactly when a stale list misleads most.
+    pub refresh_queued: bool,
+    pub confirm: PersonaConfirm,
+    pub mode: PersonaMode,
+    /// Transient status line.
+    pub status_message: Option<String>,
+}
+
+impl IdentityState {
+    /// What one membership's persona presents, as far as we know.
+    ///
+    /// Falls back to `unknown` rather than a default summary: the two render
+    /// differently on purpose, and a caller reaching for `unwrap_or_default()`
+    /// would turn "we have not asked" into "you are sharing nothing".
+    #[must_use]
+    pub fn binding_for(
+        &self,
+        membership: &PersonaMembership,
+    ) -> openvtc_core::persona::binding::BindingSummary {
+        self.bindings
+            .get(&(
+                membership.sub_context_id.clone(),
+                membership.persona_did.clone(),
+            ))
+            .cloned()
+            .unwrap_or_else(openvtc_core::persona::binding::BindingSummary::unknown)
+    }
+}
+
+// ****************************************************************************
+// VTA State
+// ****************************************************************************
+
+/// State for the VTA service information panel.
+#[derive(Clone, Debug, Default)]
+pub struct VtaState {
+    /// Active configuration profile name
+    pub profile: String,
+    /// VTA context name (fetched from VTA service)
+    pub context_name: Option<String>,
+    /// Persona DID
+    pub persona_did: String,
+    /// Verified agent name for the persona DID (`example.com/@me`), if cached —
+    /// shown above the DID in the panel.
+    pub persona_agent_name: Option<String>,
+    /// Mediator DID
+    pub mediator_did: String,
+    /// Verified agent name for [`mediator_did`](Self::mediator_did), if cached.
+    pub mediator_agent_name: Option<String>,
+    /// VTA service URL
+    pub vta_url: String,
+    /// VTA service DID
+    pub vta_did: String,
+    /// Verified agent name for [`vta_did`](Self::vta_did), if cached.
+    pub vta_agent_name: Option<String>,
+    /// Credential DID used for VTA authentication
+    pub credential_did: String,
+    /// Which transports the VTA advertises and which one this process is on.
+    pub transports: VtaTransports,
+    /// Whether the VTA's replies are reaching this app, and what is being done
+    /// when they are not.
+    pub receive: VtaReceiveStatus,
+    /// Total number of keys managed
+    pub key_count: usize,
+    /// Number of persona keys
+    pub persona_key_count: usize,
+    /// Number of relationship keys
+    pub relationship_key_count: usize,
+    /// Whether the VTA key backend is in use
+    pub is_vta_managed: bool,
+    /// DIDs in use (persona + relationship R-DIDs). `Arc<[…]>` for cheap
+    /// per-frame clones; rebuilt wholesale in `sync_from_config`.
+    pub active_dids: Arc<[ActiveDid]>,
+
+    /// Invitation credentials (VICs) the holder holds in the VTA credential
+    /// vault, for the VIC manager. Populated by an async query (not derived from
+    /// `Config`), refreshed after each mutation. `Arc<[…]>` for cheap per-frame
+    /// clones.
+    pub vics: Arc<[VicSummary]>,
+    /// Selected index into [`Self::vics`] (VIC manager navigation).
+    pub vic_selected_index: usize,
+    /// When `Some(index)`, a soft-delete of that VIC is awaiting `y`/`n`.
+    pub confirm_delete_vic: Option<usize>,
+    /// When `Some(index)`, a *purge* (irreversible) of that VIC is awaiting
+    /// `y`/`n` — kept distinct from the soft-delete arm so the prompt is explicit.
+    pub confirm_purge_vic: Option<usize>,
+    /// Whether the VIC list includes archived + soft-deleted entries (the
+    /// `include_archived` / `include_deleted` query modifiers). Toggled with `i`.
+    pub vic_show_inactive: bool,
+    /// A vault query is in flight. The list load is a network round-trip that no
+    /// longer blocks the loop, so the panel says so rather than showing a stale
+    /// (or empty) list with no sign that an answer is coming.
+    pub vic_loading: bool,
+    /// A refresh was asked for while one was already in flight, and must be
+    /// re-run once it lands. Set by the spawn helper when the busy-guard rejects
+    /// it: the in-flight query was issued *before* the mutation (or filter flip)
+    /// that prompted this request, so its result is already stale — dropping the
+    /// request instead would leave an archived VIC rendered as active until the
+    /// next manual refresh.
+    pub vic_refresh_queued: bool,
+}
+
+/// The receive leg of the admin VTA session: whether the VTA's replies reach
+/// this app.
+///
+/// Shown beside the transport because a send that succeeds says nothing about
+/// it — the request reaches the VTA either way, and only the replies tell a
+/// working session from one whose inbox is not being collected (2026-10-05).
+#[derive(Clone, Debug, Default)]
+pub struct VtaReceiveStatus {
+    /// The session's last health snapshot. `None` with no admin session.
+    pub health: Option<openvtc_core::vta_receive_leg::ReceiveHealth>,
+    /// When [`health`](Self::health) was taken, so the panel can age the
+    /// "last reply" between checks.
+    pub observed_at: Option<std::time::Instant>,
+    /// Where rebuilding a stalled session is.
+    pub recovery: VtaRecoveryView,
+    /// The last rebuild's failure, while it is the latest word.
+    pub last_rebuild_error: Option<String>,
+    /// The device-presence call that is failing, and why — the heartbeat is
+    /// often the first call to notice a stalled session.
+    pub presence_problem: Option<String>,
+}
+
+/// Recovery of a stalled admin session, for the panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VtaRecoveryView {
+    /// Nothing to recover from.
+    #[default]
+    Healthy,
+    /// Replies stopped; reconnecting at `at`.
+    Waiting {
+        /// When the next reconnect is due.
+        at: std::time::Instant,
+        /// Which reconnect it will be (1-based).
+        attempt: u32,
+    },
+    /// Reconnecting now.
+    Reconnecting {
+        /// Which reconnect this is (1-based).
+        attempt: u32,
+    },
+    /// Reconnected; waiting to see a reply on the new session.
+    Reconnected,
+}
+
+/// How this process reaches the VTA, and what the VTA says it offers.
+///
+/// Two independently-sourced halves, deliberately kept apart:
+///
+/// - [`in_use`](Self::in_use) is what *this* process connects over, derived
+///   synchronously from the stored key backend — `build_runtime_vta_client`
+///   picks DIDComm when a mediator DID is recorded and REST otherwise, so the
+///   same condition decides the label. No network, always accurate.
+/// - [`advertised`](Self::advertised) is what the VTA's own DID document
+///   publishes (`#tsp`, `#vta-rest` and `DIDCommMessaging` services), which needs a
+///   resolve. `None` until the background probe lands, so the panel can say
+///   "checking…" rather than claim a transport is unavailable merely because
+///   nothing has been asked yet.
+///
+/// Keeping them separate is what makes the panel able to distinguish "the VTA
+/// offers REST too" from "we could not ask" (VTI R6.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VtaTransports {
+    /// Transport this process is configured to use.
+    pub in_use: VtaTransport,
+    /// REST base URL from the stored config, if any. This is the URL that was
+    /// `VTA URL` before — kept as *detail under* the transport rather than as
+    /// the headline fact.
+    pub rest_url: String,
+    /// What the VTA's DID document advertises. `None` until probed.
+    pub advertised: Option<AdvertisedTransports>,
+}
+
+/// One VTA transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VtaTransport {
+    /// DIDComm via a mediator (the VTA session is the authenticator).
+    #[default]
+    DidComm,
+    /// REST challenge-response against the VTA URL.
+    Rest,
+}
+
+impl VtaTransport {
+    /// Label for the panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            VtaTransport::DidComm => "DIDComm",
+            VtaTransport::Rest => "REST",
+        }
+    }
+}
+
+/// The transports a VTA's DID document advertises, as resolved by
+/// `vta_sdk::provision_client::resolve_vta`.
+///
+/// This is *offered*, not *usable*: a transport appears here because the VTA
+/// publishes it, regardless of whether this CLI can speak it. TSP is currently
+/// the case in point — advertised by the VTA, not yet spoken by us — and the
+/// panel has to keep those apart, because "not offered" and "offered but we
+/// cannot use it" call for different operator action (VTI R6.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdvertisedTransports {
+    /// Mediator DID from the document's `#tsp` (`TSPTransport`) service, if any.
+    ///
+    /// Read from that entry specifically — *not* assumed to equal
+    /// [`mediator_did`](Self::mediator_did), even though a dual-transport VTA
+    /// usually points both at the same mediator.
+    pub tsp_mediator_did: Option<String>,
+    /// Mediator DID from the document's `DIDCommMessaging` service, if any.
+    pub mediator_did: Option<String>,
+    /// REST base URL from the document's `#vta-rest` service, if any.
+    pub rest_url: Option<String>,
+    /// Set when the probe itself failed — the transports are unknown, not
+    /// absent. Rendered as an explicit "could not check" so an unreachable
+    /// publication endpoint never reads as "the VTA offers nothing".
+    pub error: Option<String>,
+}
+
+/// Display summary of one held VIC, mapped from the VTA credential-vault
+/// `CredentialDescriptor` (descriptor only — the credential body is never
+/// fetched for the list). Wire fields are camelCase.
+#[derive(Clone, Debug, Default)]
+pub struct VicSummary {
+    /// Vault id — the handle for archive / delete / restore / purge.
+    pub id: String,
+    /// Issuer DID (the community that issued the invitation), if recorded.
+    pub issuer: String,
+    /// Verified agent name for [`issuer`](Self::issuer), if cached.
+    ///
+    /// The issuer is a community VTC DID, which the agent-name background sweep
+    /// already targets, so a name is usually available. Not set by
+    /// [`VicSummary::from_descriptor`] — that maps a vault descriptor and has no
+    /// `Config` — but stitched on in `MainPageState::sync_vic_agent_names`,
+    /// which runs at every `sync_from_config` and after every vault reload.
+    pub issuer_agent_name: Option<String>,
+    /// Validity status: "valid" / "expired" / "revoked" / "unknown".
+    pub status: String,
+    /// Archival lifecycle (active / archived / deleted), orthogonal to status.
+    pub lifecycle: VicLifecycle,
+    /// RFC 3339 validity-window end, if declared (shown as detail).
+    pub valid_until: String,
+}
+
+impl VicSummary {
+    /// Map one `credentials[]` descriptor (camelCase JSON) to a summary.
+    pub fn from_descriptor(d: &serde_json::Value) -> Self {
+        let s = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        VicSummary {
+            id: s("id"),
+            issuer: s("issuerDid"),
+            // No `Config` here; filled in by `sync_vic_agent_names`.
+            issuer_agent_name: None,
+            status: {
+                let st = s("status");
+                if st.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    st
+                }
+            },
+            lifecycle: VicLifecycle::from_wire(d.get("lifecycle").and_then(|v| v.as_str())),
+            valid_until: s("validUntil"),
+        }
+    }
+}
+
+/// The archival lifecycle state of a held VIC (vault `lifecycle` dimension).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VicLifecycle {
+    /// Live and presentable. Omitted from the descriptor → defaults here.
+    #[default]
+    Active,
+    /// Hidden from presentation but retained; restorable via unarchive.
+    Archived,
+    /// Soft-deleted tombstone; restorable within the grace window, else purged.
+    Deleted,
+}
+
+impl VicLifecycle {
+    fn from_wire(s: Option<&str>) -> Self {
+        match s {
+            Some("archived") => VicLifecycle::Archived,
+            Some("deleted") => VicLifecycle::Deleted,
+            _ => VicLifecycle::Active,
+        }
+    }
+
+    /// Short tag for the panel row.
+    pub fn tag(self) -> &'static str {
+        match self {
+            VicLifecycle::Active => "active",
+            VicLifecycle::Archived => "archived",
+            VicLifecycle::Deleted => "deleted",
+        }
+    }
+}
+
+/// "Import an invitation credential" overlay (paste a VIC → store it in the
+/// vault). `Some` while open; floats over the main page like the create-persona
+/// overlay. Walks `Input` (paste the VIC JSON) → `Working` (the vault receive
+/// runs) → `Done` or `Failed`.
+#[derive(Clone, Debug, Default)]
+pub struct AddVicState {
+    /// Which step of the overlay is showing.
+    pub phase: AddVicPhase,
+    /// The pasted VIC JSON, used while in the `Input` phase.
+    pub input: tui_input::Input,
+    /// Progress / validation / error lines.
+    pub messages: Vec<String>,
+}
+
+/// Step of the [`AddVicState`] overlay.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AddVicPhase {
+    /// Awaiting the pasted VIC JSON (validated on submit).
+    #[default]
+    Input,
+    /// The vault receive is running (input locked).
+    Working,
+    /// Stored successfully.
+    Done,
+    /// Validation or storage failed; show the error.
+    Failed,
+}
+
+/// A persona DID in the account's context, for the DID manager view.
+#[derive(Clone, Debug, Default)]
+pub struct ManagedDid {
+    /// The persona's identity: a `did:webvh`, or a bare `did:scid:vh:1`.
+    pub did: String,
+    /// For a did:scid persona, its DID URL with `?src=`, which names the host
+    /// a bare did:scid cannot.
+    pub did_locator: Option<String>,
+    /// Verified agent name for [`did`](Self::did) (`example.com/@me`), if one is
+    /// cached. Shown in place of the DID; the DID is the fallback. Populated in
+    /// `sync_from_config` from the persisted cache, which only ever holds
+    /// round-tripped (verified) lookups.
+    pub agent_name: Option<String>,
+    /// Optional human label.
+    pub label: String,
+    /// How many communities present this persona (0 ⇒ orphan).
+    pub bound_communities: usize,
+    /// Whether this is the account's current active persona.
+    pub is_active: bool,
+}
+
+/// A DID in active use within this context.
+#[derive(Clone, Debug, Default)]
+pub struct ActiveDid {
+    /// The DID string
+    pub did: String,
+    /// Verified agent name for [`did`](Self::did), if one is cached. Shown in
+    /// place of the DID; the DID is the fallback. A relationship R-DID is a
+    /// per-relationship pseudonym and never carries one, so this stays `None`
+    /// for those rows.
+    pub agent_name: Option<String>,
+    /// Human-readable label
+    pub label: String,
+}
+
+// ****************************************************************************
+// Vetting State
+// ****************************************************************************
+
+/// Vetting methods, in the order the page cycles through them.
+pub const VETTING_METHODS: [VettingMethod; 3] = [
+    VettingMethod::InPerson,
+    VettingMethod::Video,
+    VettingMethod::PriorAcquaintance,
+];
+
+/// Declared relationships, in the order the page cycles through them.
+pub const VETTING_RELATIONSHIPS: [VettingRelationship; 5] = [
+    VettingRelationship::None,
+    VettingRelationship::CommunityColleague,
+    VettingRelationship::SameEmployer,
+    VettingRelationship::Family,
+    VettingRelationship::OtherPersonal,
+];
+
+/// Reasons a vetter may give for withdrawing a statement.
+pub const VETTING_WITHDRAWAL_REASONS: [revoke_statement::v0_1::PayloadReason; 4] = [
+    revoke_statement::v0_1::PayloadReason::Mistake,
+    revoke_statement::v0_1::PayloadReason::NewInformation,
+    revoke_statement::v0_1::PayloadReason::KeyCompromise,
+    revoke_statement::v0_1::PayloadReason::Other,
+];
+
+/// The reasons a vetter can give for declining, in the order the page cycles
+/// through them, each with what it tells the applicant. The first is no reason
+/// at all, and is where the choice starts: the protocol makes the code
+/// optional because a vetter never owes one.
+pub const DECLINE_REASONS: [(Option<decline::v0_1::PayloadCode>, &str); 6] = [
+    (None, "no reason given"),
+    (
+        Some(decline::v0_1::PayloadCode::CouldNotVerify),
+        "could not establish who you are",
+    ),
+    (
+        Some(decline::v0_1::PayloadCode::DocumentMismatch),
+        "your document did not match your card or you",
+    ),
+    (
+        Some(decline::v0_1::PayloadCode::LivenessFailed),
+        "the match code could not be confirmed with you",
+    ),
+    (
+        Some(decline::v0_1::PayloadCode::NotComfortable),
+        "the vetter prefers not to vouch for you",
+    ),
+    (Some(decline::v0_1::PayloadCode::Other), "another reason"),
+];
+
+/// The longest note a decline can carry (`vetting/decline/0.1` `message`).
+pub const DECLINE_MESSAGE_MAX: usize = 500;
+
+/// What a decline `code` tells the applicant, in words.
+#[must_use]
+pub fn decline_reason_words(code: decline::v0_1::PayloadCode) -> &'static str {
+    DECLINE_REASONS
+        .iter()
+        .find(|(c, _)| *c == Some(code))
+        .map_or("another reason", |(_, words)| words)
+}
+
+/// How many requests a new ticket admits: one person, or a conference desk.
+pub const VETTING_TICKET_USES: [u32; 4] = [1, 5, 10, 25];
+
+/// The label on each row of a vetting form, in the order the form shows them.
+///
+/// These are the rows' names in three senses at once: what the panel prints in
+/// the left column, what a [`DraftError`](openvtc_core::vetting::registry::DraftError)
+/// calls the row it refused, and — through [`row_of`] — which row the cursor
+/// jumps to when it does. One array rather than three copies, because a label
+/// that drifts between the message and the renderer would move the cursor to
+/// the wrong row, which is worse than not moving it at all.
+///
+/// Directory filter rows, before the results.
+pub const DIRECTORY_LABELS: [&str; 9] = [
+    "Community",
+    "Language",
+    "Country",
+    "Region",
+    "City",
+    "Method",
+    "Events from",
+    "Events until",
+    "Event name",
+];
+
+/// Vetter profile rows, before its events. The three method ticks share one
+/// label, printed against the first of them — so "I vet" resolves to that row,
+/// which is where the cursor belongs when no method is ticked.
+pub const PROFILE_LABELS: [&str; 13] = [
+    "Community",
+    "Listed",
+    "Display name",
+    "Languages",
+    "Country",
+    "Region",
+    "City",
+    "I vet",
+    "",
+    "",
+    "Documents I accept",
+    "Availability",
+    "How to get a ticket",
+];
+
+/// Event form rows.
+pub const EVENT_LABELS: [&str; 7] = [
+    "Name",
+    "First day",
+    "Last day",
+    "Country",
+    "Region",
+    "City",
+    "Web page",
+];
+
+/// The row `label` names, for moving the cursor to it. `None` when the label
+/// belongs to no row on this form — an error about a row a different form owns,
+/// which leaves the cursor where it is rather than moving it somewhere
+/// arbitrary.
+#[must_use]
+pub fn row_of(labels: &[&str], label: &str) -> Option<usize> {
+    labels.iter().position(|l| *l == label && !l.is_empty())
+}
+
+/// Directory filter fields, before the results: community, language, country,
+/// region, city, method, events from, events until, event name.
+pub const DIRECTORY_FIELDS: usize = DIRECTORY_LABELS.len();
+
+/// Methods a directory search can ask for: any, then each.
+pub const DIRECTORY_METHODS: [Option<VettingMethod>; 4] = [
+    None,
+    Some(VettingMethod::InPerson),
+    Some(VettingMethod::Video),
+    Some(VettingMethod::PriorAcquaintance),
+];
+
+/// Profile form fields, before its events: community, listed, display name,
+/// languages, country, region, city, the three methods, documentation,
+/// availability and how to get a ticket.
+pub const PROFILE_FIELDS: usize = PROFILE_LABELS.len();
+
+/// Event form fields: name, first day, last day, country, region, city, page.
+pub const EVENT_FIELDS: usize = EVENT_LABELS.len();
+
+/// Whether a line is good news, worth a second look, or bad news.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineTone {
+    Good,
+    Caution,
+    Bad,
+}
+
+/// How a method reads on the page.
+#[must_use]
+pub fn method_label(method: VettingMethod) -> &'static str {
+    match method {
+        VettingMethod::InPerson => "in person",
+        VettingMethod::Video => "video call",
+        VettingMethod::PriorAcquaintance => "prior acquaintance",
+        _ => "other",
+    }
+}
+
+/// How a declared relationship reads on the page.
+#[must_use]
+pub fn relationship_label(relationship: VettingRelationship) -> &'static str {
+    match relationship {
+        VettingRelationship::None => "no prior relationship",
+        VettingRelationship::CommunityColleague => "we work together in the community",
+        VettingRelationship::SameEmployer => "same employer",
+        VettingRelationship::Family => "family",
+        VettingRelationship::OtherPersonal => "another personal relationship",
+        _ => "other",
+    }
+}
+
+/// How a withdrawal reason reads on the page.
+#[must_use]
+pub fn reason_label(reason: revoke_statement::v0_1::PayloadReason) -> &'static str {
+    match reason {
+        revoke_statement::v0_1::PayloadReason::Mistake => "I made a mistake",
+        revoke_statement::v0_1::PayloadReason::NewInformation => "I learned something new",
+        revoke_statement::v0_1::PayloadReason::KeyCompromise => "my signing key was compromised",
+        _ => "another reason",
+    }
+}
+
+/// Which list the Vetting page shows.
+///
+/// Two tabs, because the page holds two roles and they are not peers: being
+/// vetted, and vetting. Design §12.3 asks for exactly this — "Applications" and
+/// a "Vetter Desk" whose sub-views are the queue, tickets and issued
+/// statements — and the flat four-tab layout this replaced put a vetter's own
+/// inbound queue beside their outbound tickets as if they were separate
+/// concerns rather than two halves of one desk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VettingTab {
+    /// Our applications to be vetted.
+    #[default]
+    Applications,
+    /// Everything we do as a vetter, in [`DeskView`]s.
+    Desk,
+}
+
+impl VettingTab {
+    /// The tab after this one.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            VettingTab::Applications => VettingTab::Desk,
+            VettingTab::Desk => VettingTab::Applications,
+        }
+    }
+}
+
+/// Which part of the vetting desk is showing: inbound, outbound, and the record
+/// of what we signed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeskView {
+    /// Requests people have made of us as a vetter.
+    #[default]
+    Requests,
+    /// Tickets we have handed out — how those requests are able to arrive.
+    Tickets,
+    /// Statements we have signed.
+    Issued,
+}
+
+impl DeskView {
+    /// Every view, in the order the desk shows them: what has arrived, what we
+    /// sent out to let it arrive, then what came of it.
+    pub const ALL: [DeskView; 3] = [DeskView::Requests, DeskView::Tickets, DeskView::Issued];
+
+    /// The view `step` places along, wrapping. `←`/`→` move by one.
+    #[must_use]
+    pub fn shifted(self, forward: bool) -> Self {
+        let at = Self::ALL.iter().position(|v| *v == self).unwrap_or(0);
+        let len = Self::ALL.len();
+        let next = if forward {
+            (at + 1) % len
+        } else {
+            (at + len - 1) % len
+        };
+        Self::ALL[next]
+    }
+
+    /// Its name on the sub-view line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            DeskView::Requests => "Requests",
+            DeskView::Tickets => "Tickets",
+            DeskView::Issued => "History",
+        }
+    }
+}
+
+/// State for the Vetting page, rebuilt from the book on every config change.
+#[derive(Clone, Debug, Default)]
+pub struct VettingState {
+    pub tab: VettingTab,
+    /// Which part of the desk is showing, while [`tab`](Self::tab) is
+    /// [`VettingTab::Desk`]. Kept across a switch to Applications and back, so
+    /// returning to the desk returns to the view left open.
+    pub desk_view: DeskView,
+    pub selected: usize,
+    pub mode: VettingMode,
+    pub status_message: Option<String>,
+    pub applications: Arc<[ApplicationRow]>,
+    pub desk: Arc<[DeskRow]>,
+    pub tickets: Arc<[TicketRow]>,
+    pub issued: Arc<[IssuedRow]>,
+    /// Requests we declined, as `(community, date)`: the record that we
+    /// vetted someone, with nothing about who.
+    pub declined: Arc<[(String, String)]>,
+    /// Personas an application can join with.
+    pub personas: Arc<[VettingPersona]>,
+    /// Communities we are an active member of, and so can vet for.
+    pub memberships: Arc<[VettingMembership]>,
+    /// The documentation this vetter accepts, then `none`.
+    pub documentation: Arc<[String]>,
+    /// Communities a vetter has already asked for requirements this run, so a
+    /// second attempt to open a session proceeds instead of asking again.
+    pub requirements_requested: Vec<String>,
+    /// The face each application wears, by application id, once read or
+    /// chosen this run.
+    pub worn_faces: std::collections::HashMap<String, String>,
+    /// The card (application id, session id) a face is being chosen for.
+    ///
+    /// Set when `f` is pressed on the card page, because a missing or wrong
+    /// face is what that page reports. Choosing, making, or backing out of the
+    /// face then returns to that card rather than to the list, which would
+    /// leave the holder to find the application and the open session again.
+    pub card_after_face: Option<(String, String)>,
+    /// The application or desk request open as a journey, if any. While one
+    /// is, the page is that journey — every step in order, where it stands,
+    /// and what it is for — and takes the whole width of the screen.
+    pub journey_target: Option<JourneyTarget>,
+    /// [`journey_target`](Self::journey_target), worked out from the book on
+    /// every sync. `None` when nothing is open, or what was open has gone.
+    pub journey: Option<JourneyView>,
+    /// Communities whose vetter directory can be searched: those applied to,
+    /// then those joined.
+    pub directory_communities: Arc<[DirectoryCommunity]>,
+    /// Active memberships holding no live vetter credential, which can ask for
+    /// it again.
+    pub resend_candidates: Arc<[VettingMembership]>,
+    /// Where we stand as a vetter with each community that has named us one —
+    /// the desk's header. Includes lapsed grants, which nothing else does.
+    pub standing: Arc<[VetterStandingRow]>,
+    /// Event tiers a community we vet for is offering, one row per (event,
+    /// tier). The menu §5.1 asks for: a vetter picks a published rate rather
+    /// than naming one, so that what they asked for is not itself a
+    /// distinguishing detail.
+    pub event_offers: Arc<[EventOffer]>,
+    /// Hidden vetting, one row per community we hold an engine for — the
+    /// hidden-vetting view (`h` on the desk).
+    pub hidden: Arc<[HiddenVettingRow]>,
+    /// Stored vetting credentials set aside on load because they pre-date DTG
+    /// Credentials v1 (`VettingBook::retired`), one sentence each.
+    pub retired: Arc<[String]>,
+    /// A ticket asked for and waiting on a fresh reading of how its community vets. Run state,
+    /// never rebuilt from the book: the ticket does not exist until the answer decides it.
+    pub pending_ticket: Option<PendingTicket>,
+}
+
+/// A ticket asked for (`t`) and not issued yet: whether it may be, and under which mode, is
+/// decided only on an answer about the community's mode that arrived after
+/// [`asked_at`](Self::asked_at) — never on what the client remembered.
+#[derive(Clone, Debug)]
+pub struct PendingTicket {
+    /// The community and persona it is for.
+    pub membership: VettingMembership,
+    /// Requests it will admit.
+    pub uses: u32,
+    /// When the community was asked how it vets.
+    pub asked_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One community's hidden vetting, as the vetter's own view shows it.
+///
+/// Every value here is the vetter's own and stays on this device: what the
+/// community knows of us is that we enrolled and that we draw on schedule,
+/// never how many tokens we hold or have spent.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct HiddenVettingRow {
+    /// The community, named as the rest of the page names it.
+    pub community: String,
+    /// Its accent swatch, if it publishes one.
+    pub accent: Option<(u8, u8, u8)>,
+    /// The class labels we hold a credential under, with when each was
+    /// enrolled, newest first: `("vetter/2026-10", Some("2026-10-01"))`.
+    pub enrolled: Vec<(String, Option<String>)>,
+    /// The class label the community enrols under now, when we hold no
+    /// credential under it yet.
+    pub enrolment_owed: Option<String>,
+    /// The community enrolled us under the owed label and the answer could not be opened; it
+    /// issues one credential per label, so the schedule does not ask again under it.
+    pub enrolment_lost: bool,
+    /// Questions in a row the community left unanswered; `waiting_until` is then the backoff,
+    /// not a `tickNotYet` wait.
+    pub unanswered: u32,
+    /// Tokens held.
+    pub tokens_held: usize,
+    /// Of those, the ones under a label the community still accepts.
+    pub tokens_free: usize,
+    /// Tokens spent on attestations here.
+    pub tokens_spent: u32,
+    /// The token labels the community issues under now.
+    pub token_labels: Vec<String>,
+    /// The tick length, in words ("3 days", "12 hours").
+    pub tick_length: String,
+    /// Tokens a tick under the ordinary label, as the community publishes it.
+    pub drip_per_tick: usize,
+    /// Tokens a tick this client asks for under the ordinary label: the published rate, or
+    /// less when an `overQuota` refusal said the community issues less.
+    pub drawn_per_tick: usize,
+    /// When the parameters were last read from the community, in words ("read 21:16 UTC").
+    pub params_read: String,
+    /// Why draws are held on the parameters, when they are.
+    pub params_hold: Option<String>,
+    /// The last tick served, in words.
+    pub last_draw: Option<String>,
+    /// When the next tick window opens.
+    pub next_window: Option<String>,
+    /// Event requests: (event, state, group size, floor).
+    pub events: Vec<(String, String, usize, usize)>,
+    /// The last refusal, in words.
+    pub last_refusal: Option<String>,
+    /// Waiting for the community's clock (`tickNotYet`), until this time.
+    pub waiting_until: Option<String>,
+    /// The community publishes keys other than ours; the drip has stopped.
+    pub rekeyed: Option<String>,
+    /// The community refused us as another hidden-vetting key: where getting back to the one it
+    /// bound — restored at the VTA, or reset by an admin — stands. Empty while nothing is wrong.
+    pub key: Vec<HiddenKeyLine>,
+    /// Enrolment waits on [`Self::key`]: asking now would only be refused again.
+    pub enrolment_held: bool,
+}
+
+/// One line of the hidden-vetting view about the vetter's key ("Key", "Reset").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HiddenKeyLine {
+    /// "Key" or "Reset".
+    pub label: &'static str,
+    /// What it says.
+    pub text: String,
+    /// The vetter has to do something about it.
+    pub act: bool,
+}
+
+/// One (event, tier) a community we vet for is offering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventOffer {
+    /// The community running it.
+    pub community: String,
+    /// Its display name.
+    pub community_name: String,
+    /// Our persona there.
+    pub persona: PersonaId,
+    /// The community's name for the gathering.
+    pub event_id: String,
+    /// The tier, as the menu names it.
+    pub tier: String,
+    /// What that tier yields a tick.
+    pub drip_per_tick: usize,
+    /// The event's own days, which are the window we ask for.
+    pub start_date: chrono::NaiveDate,
+    pub end_date: chrono::NaiveDate,
+    /// How many vetters the community needs before it opens the label at all.
+    pub group_floor: usize,
+    /// Where our request stands, if we have made one.
+    pub state: Option<String>,
+    /// How many have asked so far, if the community has told us.
+    pub group_size: Option<usize>,
+}
+
+impl VettingState {
+    /// Rows in the list currently showing.
+    #[must_use]
+    pub fn tab_len(&self) -> usize {
+        match self.tab {
+            VettingTab::Applications => self.applications.len(),
+            VettingTab::Desk => match self.desk_view {
+                DeskView::Requests => self.desk.len(),
+                DeskView::Tickets => self.tickets.len(),
+                DeskView::Issued => self.issued.len(),
+            },
+        }
+    }
+}
+
+/// One community's line in the vetting desk header: what it made us, until
+/// when, and what it holds of our profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VetterStandingRow {
+    /// The community, named as the rest of the page names it.
+    pub community: String,
+    /// Its accent swatch, if it publishes one.
+    pub accent: Option<(u8, u8, u8)>,
+    /// The grant's standing in a few words — "until 2027-01-18", "expires in
+    /// 12 days", "expired".
+    pub grant: String,
+    /// Whether [`grant`](Self::grant) is bad news, and should read as such.
+    pub grant_warns: bool,
+    /// What the community holds of our profile — "listed", "not listed",
+    /// "sent, no answer yet", "refused: notEligible", or that we sent none.
+    pub profile: String,
+    /// Where we stand for PCS ZKP attesting there, when the community hides its vetters: the
+    /// tokens held and when that changes ("3 tokens — next drip due …"). `None` for a community
+    /// that names its vetters.
+    pub tokens: Option<String>,
+    /// Whether [`tokens`](Self::tokens) means this vetter cannot attest there now.
+    pub tokens_warn: bool,
+    /// How the community vets, when that is not current knowledge: the last reading's age once
+    /// it is stale, or why the last attempt to read it failed. `None` while fresh.
+    pub mode_note: Option<String>,
+}
+
+/// One of the holder's pool attributes, as a row to tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolRow {
+    pub attribute_id: String,
+    pub claim_type: String,
+    /// What to call it on screen — the holder's label, else the claim type.
+    pub label: String,
+    /// The value as the Identity page paints it — masked where the claim
+    /// type's registry entry says so — or `None` when the store sent none. A
+    /// face is chosen for what it will show a vetter, so the value is the check
+    /// the holder actually makes; a label alone cannot tell two legal names
+    /// apart.
+    pub value: Option<String>,
+}
+
+/// Which row of the new-face form has the keyboard.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NewFaceFocus {
+    #[default]
+    Name,
+    /// The n-th of [`NewFaceForm::asked`]: a claim type the community (or a
+    /// vetter's session) asked for.
+    Asked(usize),
+    /// The n-th of [`NewFaceForm::extras`]: something held but not asked for.
+    Extra(usize),
+}
+
+/// What Enter on the new-face form does next.
+#[derive(Clone, Debug)]
+pub enum NewFaceStep {
+    /// Nothing to send. The focus has moved to what is missing, and the form's
+    /// status line says what it is.
+    Wait,
+    /// Save this typed value as a new attribute, then tick it.
+    Save(openvtc_core::persona::pool::AttributeDraft),
+    /// Make the face from these attributes, in this order, and wear it.
+    Make {
+        name: String,
+        live_refs: Vec<String>,
+    },
+}
+
+/// A claim type as a heading: `name.legal` is "Legal name".
+///
+/// From [`claim_words`](openvtc_core::vetting::guide::claim_words), the table
+/// the join page already speaks with, so a requirement reads the same on every
+/// page that names it; an unknown type falls back to its own words.
+#[must_use]
+pub fn claim_heading(claim_type: &str) -> String {
+    let words = openvtc_core::vetting::guide::claim_words(claim_type);
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => claim_type.to_string(),
+    }
+}
+
+/// Making a face without leaving the vetting flow.
+///
+/// The general face editor lives on the Identity page and is the right place to
+/// build a face for its own sake. This is the narrow case: a community has
+/// already said which claim types its card must carry, so the form is driven by
+/// that list — one row per claim type asked for, each either ready or not.
+///
+/// A required claim type the pool has nothing for is filled in right here. The
+/// holder used to be sent to My Identity to add it under a type key they had no
+/// reason to know, and back again to press `f`; most stopped at that point.
+/// The value is saved through the same write My Identity makes
+/// ([`pool::draft_from_text`](openvtc_core::persona::pool::draft_from_text),
+/// then [`pool::put`](openvtc_core::persona::pool::put)), so it is a real,
+/// self-asserted attribute that page lists and edits like any other.
+///
+/// Only what is asked for is ticked. Optional claim types and the rest of the
+/// pool are offered, never pre-ticked: a face shows what it holds, and showing
+/// more than the community asked is the holder's choice to make, not ours.
+#[derive(Clone, Debug, Default)]
+pub struct NewFaceForm {
+    pub application_id: String,
+    /// The claim types this community's card must carry.
+    pub required: Vec<String>,
+    /// Claim types a vetter's session named as optional.
+    pub optional: Vec<String>,
+    /// Every attribute the holder has.
+    pub pool: Vec<PoolRow>,
+    pub name: String,
+    /// Attribute ids ticked, in the order they were ticked — which is the
+    /// order the face will present them in.
+    pub ticked: Vec<String>,
+    /// What has been typed for each required claim type the pool cannot
+    /// supply, by claim type.
+    pub drafts: HashMap<String, String>,
+    pub focus: NewFaceFocus,
+    /// The claim type whose new attribute is being saved. The form waits on it
+    /// rather than closing, because ticking it is the next thing that happens.
+    pub saving: Option<String>,
+    /// A refusal to show: a value that did not parse, or a save that failed.
+    /// Never a restatement of the status line.
+    pub error: Option<String>,
+}
+
+impl NewFaceForm {
+    /// Open the form on what the community asked for.
+    ///
+    /// Each required claim type starts ticked with the first attribute that
+    /// carries it, and the focus starts on the first one that still needs a
+    /// value — which is the one thing a holder with an empty pool has to do.
+    #[must_use]
+    pub fn open(
+        application_id: String,
+        required: Vec<String>,
+        optional: Vec<String>,
+        pool: Vec<PoolRow>,
+        name: String,
+    ) -> Self {
+        let ticked: Vec<String> = required
+            .iter()
+            .filter_map(|want| {
+                pool.iter()
+                    .find(|a| &a.claim_type == want)
+                    .map(|a| a.attribute_id.clone())
+            })
+            .collect();
+        let mut form = Self {
+            application_id,
+            required,
+            optional,
+            pool,
+            name,
+            ticked,
+            ..Self::default()
+        };
+        form.focus = form.first_unfilled().unwrap_or(NewFaceFocus::Name);
+        form
+    }
+
+    /// The claim types asked for, required first, each with whether it is
+    /// required. An optional type the community also requires is listed once,
+    /// as required.
+    #[must_use]
+    pub fn asked(&self) -> Vec<(&str, bool)> {
+        let mut out: Vec<(&str, bool)> = Vec::new();
+        for (claim_type, required) in self
+            .required
+            .iter()
+            .map(|c| (c, true))
+            .chain(self.optional.iter().map(|c| (c, false)))
+        {
+            if !out.iter().any(|(seen, _)| *seen == claim_type.as_str()) {
+                out.push((claim_type.as_str(), required));
+            }
+        }
+        out
+    }
+
+    /// Attributes that carry `claim_type`.
+    #[must_use]
+    pub fn candidates(&self, claim_type: &str) -> Vec<&PoolRow> {
+        self.pool
+            .iter()
+            .filter(|a| a.claim_type == claim_type)
+            .collect()
+    }
+
+    /// The attribute ticked for `claim_type`, if any.
+    #[must_use]
+    pub fn chosen(&self, claim_type: &str) -> Option<&PoolRow> {
+        self.ticked.iter().find_map(|id| {
+            self.pool
+                .iter()
+                .find(|a| &a.attribute_id == id && a.claim_type == claim_type)
+        })
+    }
+
+    /// Attributes held but not asked for, offered unticked.
+    #[must_use]
+    pub fn extras(&self) -> Vec<&PoolRow> {
+        let asked = self.asked();
+        self.pool
+            .iter()
+            .filter(|a| !asked.iter().any(|(c, _)| *c == a.claim_type))
+            .collect()
+    }
+
+    /// Whether `claim_type`'s row is a field to type into: it is required and
+    /// nothing in the pool carries it.
+    #[must_use]
+    pub fn needs_input(&self, claim_type: &str) -> bool {
+        self.required.iter().any(|r| r == claim_type) && self.candidates(claim_type).is_empty()
+    }
+
+    /// What has been typed for `claim_type`.
+    #[must_use]
+    pub fn draft(&self, claim_type: &str) -> &str {
+        self.drafts.get(claim_type).map_or("", String::as_str)
+    }
+
+    /// The claim types the ticked attributes would disclose.
+    #[must_use]
+    pub fn covered(&self) -> Vec<&str> {
+        self.pool
+            .iter()
+            .filter(|a| self.ticked.contains(&a.attribute_id))
+            .map(|a| a.claim_type.as_str())
+            .collect()
+    }
+
+    /// Required claim types the current selection still does not carry.
+    #[must_use]
+    pub fn still_missing(&self) -> Vec<&str> {
+        let covered = self.covered();
+        self.required
+            .iter()
+            .filter(|r| !covered.contains(&r.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Whether Enter would make the face now.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.saving.is_none()
+            && self.still_missing().is_empty()
+            && !self.name.trim().is_empty()
+            && !self.ticked.is_empty()
+    }
+
+    /// The rows, in the order the keyboard moves through them.
+    fn rows(&self) -> Vec<NewFaceFocus> {
+        std::iter::once(NewFaceFocus::Name)
+            .chain((0..self.asked().len()).map(NewFaceFocus::Asked))
+            .chain((0..self.extras().len()).map(NewFaceFocus::Extra))
+            .collect()
+    }
+
+    /// Move to the next (or previous) row, wrapping.
+    pub fn move_focus(&mut self, forward: bool) {
+        let rows = self.rows();
+        let at = rows.iter().position(|r| *r == self.focus).unwrap_or(0);
+        let n = rows.len();
+        self.focus = rows[if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        }];
+    }
+
+    /// The required row the holder should be looking at: the first claim type
+    /// the selection does not carry yet.
+    fn first_unfilled(&self) -> Option<NewFaceFocus> {
+        let missing = self.still_missing();
+        let first = missing.first()?;
+        self.asked()
+            .iter()
+            .position(|(c, _)| c == first)
+            .map(NewFaceFocus::Asked)
+    }
+
+    /// The claim type under the focus, when the focus is on an asked row.
+    fn focused_claim(&self) -> Option<(String, bool)> {
+        match self.focus {
+            NewFaceFocus::Asked(i) => self
+                .asked()
+                .get(i)
+                .map(|(c, required)| ((*c).to_string(), *required)),
+            _ => None,
+        }
+    }
+
+    /// Choose the next (or previous) attribute for the focused claim type.
+    ///
+    /// ←/→ and, for a required type with several, Space. The chosen one takes
+    /// the place of the one it replaces in the tick order, so changing which
+    /// legal name is shown does not reorder the card.
+    pub fn pick(&mut self, forward: bool) {
+        let Some((claim_type, _)) = self.focused_claim() else {
+            return;
+        };
+        let ids: Vec<String> = self
+            .candidates(&claim_type)
+            .iter()
+            .map(|a| a.attribute_id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self
+            .chosen(&claim_type)
+            .and_then(|c| ids.iter().position(|id| *id == c.attribute_id));
+        let next = match current {
+            None => 0,
+            Some(i) if forward => (i + 1) % ids.len(),
+            Some(i) => (i + ids.len() - 1) % ids.len(),
+        };
+        let slot = self
+            .ticked
+            .iter()
+            .position(|id| ids.contains(id))
+            .unwrap_or(self.ticked.len());
+        self.ticked.retain(|id| !ids.contains(id));
+        self.ticked
+            .insert(slot.min(self.ticked.len()), ids[next].clone());
+        self.error = None;
+    }
+
+    /// Space on the focused row.
+    ///
+    /// A required claim type with several attributes steps to the next, since
+    /// one of them has to be shown; anything else ticks or unticks.
+    pub fn toggle(&mut self) {
+        let id = match self.focus {
+            NewFaceFocus::Name => return,
+            NewFaceFocus::Asked(_) => {
+                let Some((claim_type, required)) = self.focused_claim() else {
+                    return;
+                };
+                let candidates = self.candidates(&claim_type);
+                if candidates.is_empty() {
+                    return;
+                }
+                if required && candidates.len() > 1 {
+                    return self.pick(true);
+                }
+                match self.chosen(&claim_type) {
+                    Some(c) => c.attribute_id.clone(),
+                    None => candidates[0].attribute_id.clone(),
+                }
+            }
+            NewFaceFocus::Extra(i) => match self.extras().get(i) {
+                Some(row) => row.attribute_id.clone(),
+                None => return,
+            },
+        };
+        match self.ticked.iter().position(|t| *t == id) {
+            Some(i) => {
+                self.ticked.remove(i);
+            }
+            None => self.ticked.push(id),
+        }
+        self.error = None;
+    }
+
+    /// The focused text field: the name, or a required value being typed.
+    #[must_use]
+    pub fn text(&self) -> Option<&String> {
+        match self.focus {
+            NewFaceFocus::Name => Some(&self.name),
+            NewFaceFocus::Asked(_) => {
+                let (claim_type, _) = self.focused_claim()?;
+                if !self.needs_input(&claim_type) {
+                    return None;
+                }
+                static EMPTY: String = String::new();
+                Some(self.drafts.get(&claim_type).unwrap_or(&EMPTY))
+            }
+            NewFaceFocus::Extra(_) => None,
+        }
+    }
+
+    /// The focused text field, to edit.
+    pub fn text_mut(&mut self) -> Option<&mut String> {
+        match self.focus {
+            NewFaceFocus::Name => Some(&mut self.name),
+            NewFaceFocus::Asked(_) => {
+                let (claim_type, _) = self.focused_claim()?;
+                if !self.needs_input(&claim_type) || self.saving.is_some() {
+                    return None;
+                }
+                self.error = None;
+                Some(self.drafts.entry(claim_type).or_default())
+            }
+            NewFaceFocus::Extra(_) => None,
+        }
+    }
+
+    /// Enter: save a typed value, or make the face, or point at what is
+    /// missing — whichever comes first.
+    ///
+    /// A typed value goes first wherever the focus is: having typed a legal
+    /// name and tabbed to the face's name, Enter should not answer "your legal
+    /// name is missing".
+    pub fn enter(&mut self) -> NewFaceStep {
+        if self.saving.is_some() {
+            return NewFaceStep::Wait;
+        }
+        let focused = self
+            .focused_claim()
+            .map(|(c, _)| c)
+            .filter(|c| self.needs_input(c) && !self.draft(c).trim().is_empty());
+        let typed = focused.or_else(|| {
+            self.required
+                .iter()
+                .find(|c| self.needs_input(c) && !self.draft(c).trim().is_empty())
+                .cloned()
+        });
+        if let Some(claim_type) = typed {
+            return match openvtc_core::persona::pool::draft_from_text(
+                &claim_type,
+                self.draft(&claim_type),
+                vta_sdk::protocols::persona::ValueType::String,
+                None,
+            ) {
+                Ok(draft) => {
+                    self.saving = Some(claim_type);
+                    self.error = None;
+                    NewFaceStep::Save(draft)
+                }
+                Err(why) => {
+                    self.error = Some(why);
+                    NewFaceStep::Wait
+                }
+            };
+        }
+        if let Some(row) = self.first_unfilled() {
+            self.focus = row;
+            return NewFaceStep::Wait;
+        }
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            self.focus = NewFaceFocus::Name;
+            return NewFaceStep::Wait;
+        }
+        if self.ticked.is_empty() {
+            if !self.extras().is_empty() {
+                self.focus = NewFaceFocus::Extra(0);
+            }
+            return NewFaceStep::Wait;
+        }
+        NewFaceStep::Make {
+            name,
+            live_refs: self.ticked.clone(),
+        }
+    }
+
+    /// A value typed here is now an attribute: add it, tick it in place of
+    /// anything else of its type, and move on to the next thing missing.
+    pub fn saved(&mut self, row: PoolRow) {
+        self.drafts.remove(&row.claim_type);
+        if self.saving.as_deref() == Some(row.claim_type.as_str()) {
+            self.saving = None;
+        }
+        let same: Vec<String> = self
+            .candidates(&row.claim_type)
+            .iter()
+            .map(|a| a.attribute_id.clone())
+            .collect();
+        self.ticked.retain(|id| !same.contains(id));
+        self.ticked.push(row.attribute_id.clone());
+        self.pool.push(row);
+        self.error = None;
+        self.focus = self.first_unfilled().unwrap_or(NewFaceFocus::Name);
+    }
+
+    /// The form's one status line: how many required claims are ready, and the
+    /// single next thing to do. Enter does exactly what it says.
+    #[must_use]
+    pub fn status(&self) -> String {
+        if let Some(claim_type) = &self.saving {
+            return format!(
+                "Saving your {}…",
+                openvtc_core::vetting::guide::claim_words(claim_type)
+            );
+        }
+        let total = self.required.len();
+        let have = total - self.still_missing().len();
+        let head = if total == 0 {
+            "This community names no attributes".to_string()
+        } else {
+            format!(
+                "{have} of {total} required attribute{} ready",
+                if total == 1 { "" } else { "s" }
+            )
+        };
+        let next = match self.still_missing().first() {
+            Some(claim_type) => {
+                let words = openvtc_core::vetting::guide::claim_words(claim_type);
+                if !self.needs_input(claim_type) {
+                    format!("choose your {words} with ←/→ or Space")
+                } else if self.draft(claim_type).trim().is_empty() {
+                    format!("type your {words} below")
+                } else {
+                    format!("Enter: save your {words}")
+                }
+            }
+            None if self.name.trim().is_empty() => "name the face, then Enter".to_string(),
+            None if self.ticked.is_empty() && self.pool.is_empty() => {
+                "you have no attributes to show yet".to_string()
+            }
+            None if self.ticked.is_empty() => "tick what the face shows with Space".to_string(),
+            None => "Enter: make the face and wear it".to_string(),
+        };
+        format!("{head} — {next}")
+    }
+}
+
+/// What the Vetting page is doing.
+#[derive(Clone, Debug, Default)]
+pub enum VettingMode {
+    /// Browsing the active tab.
+    #[default]
+    List,
+    /// Start an application: which community, as which persona.
+    NewApplication {
+        community: String,
+        persona_index: usize,
+        /// Where the application's face is worn, and the membership lives.
+        context_options: Vec<ContextOption>,
+        context_index: usize,
+        field: usize,
+    },
+    /// The faces could not be read because this install lacks holder
+    /// authority — the one refusal with a specific answer.
+    ///
+    /// A view rather than a status line: the answer is a command, and a command
+    /// in a status line is wrapped across the width of the panel wherever the
+    /// words happen to fall, which is neither readable nor selectable.
+    HolderGrant {
+        /// The DID to grant it to, when this install has one.
+        credential_did: Option<String>,
+    },
+    /// Make a face for this community, without leaving the flow.
+    NewFace(Box<NewFaceForm>),
+    /// Choose the face an application shows vetters.
+    ChooseFace {
+        application_id: String,
+        faces: Vec<FaceChoice>,
+        index: usize,
+        /// The claim types a card for this community must carry, so the list
+        /// can say which faces can make one. Without it the picker offered
+        /// names and a count, and a face missing a required claim failed three
+        /// steps later at the card preview.
+        required: Vec<String>,
+    },
+    /// Ask a vetter, with the ticket link from their QR code.
+    ///
+    /// One field. The link carries the vetter's DID as well as the ticket, so
+    /// asking for the DID separately was asking for something the person had
+    /// just pasted — and the form filled that field in for them anyway, which
+    /// left a box on screen whose only job was to be overwritten.
+    RequestVetter {
+        application_id: String,
+        /// The link, as pasted or typed.
+        entry: String,
+        /// The vetter's DID, read out of the link. Shown, not typed.
+        vetter: String,
+        /// The scanned ticket read out of the same link.
+        ticket: Option<request::v0_1::Ticket>,
+        /// What the person should know before sending, e.g. how this vetter
+        /// hands out tickets.
+        note: Option<String>,
+    },
+    /// Search a community's vetter directory.
+    Directory(Box<DirectoryView>),
+    /// Edit and publish our vetter profile.
+    Profile(Box<VetterProfileForm>),
+    /// Ask a community to send our vetter credential again.
+    Resend { index: usize },
+    /// Ask to vet at one of a community's published events, at one of its
+    /// published tiers.
+    EventMode { index: usize },
+    /// Hidden vetting, one community at a time: what we are enrolled under,
+    /// the tokens we hold, and the drip.
+    HiddenVetting { index: usize },
+    /// Read the match code with the vetter, preview what the face shows, then
+    /// send the card.
+    SendCard {
+        application_id: String,
+        session_id: String,
+        /// What the card would show, once the VTA has said.
+        preview: Option<CardPreview>,
+    },
+    /// Hand out a ticket for one of our memberships.
+    NewTicket {
+        membership_index: usize,
+        uses_index: usize,
+        field: usize,
+    },
+    /// One ticket's QR code, with the whole panel to itself.
+    ///
+    /// A QR code is the one thing on this page that cannot be scrolled into
+    /// view: a scanner needs the whole code at once, so half of it is not a
+    /// degraded code but nothing at all. Sharing the panel with the desk
+    /// header, the view tabs, the ticket list and two key lines leaves a real
+    /// code too little room on an ordinary terminal — and this is a screen
+    /// someone else is pointing a phone at, so it should be the only thing on
+    /// it anyway.
+    ShowTicket {
+        /// Which ticket, indexed into the tickets list.
+        index: usize,
+    },
+    /// Open a session with the person in front of us.
+    OpenSession {
+        request_id: String,
+        method_index: usize,
+    },
+    /// The human check, and the statement.
+    Attest {
+        request_id: String,
+        form: AttestForm,
+    },
+    /// Confirm declining a request.
+    ConfirmDecline {
+        request_id: String,
+        /// Index into [`DECLINE_REASONS`]: 0 gives no reason, the default — a
+        /// vetter never has to justify declining.
+        reason_index: usize,
+        /// An optional note for the applicant, at most
+        /// [`DECLINE_MESSAGE_MAX`] characters. Empty sends none.
+        message: String,
+        /// 0 the reason, 1 the note.
+        field: usize,
+    },
+    /// Withdraw a statement we signed.
+    Withdraw {
+        statement_id: String,
+        reason_index: usize,
+    },
+    /// Confirm abandoning one of our own applications.
+    ConfirmAbandon { application_id: String },
+    /// Confirm deleting one of our own tickets.
+    ///
+    /// A ticket is the only thing that gets a request answered, and the people
+    /// holding one are not reachable to be told it is gone: their request is
+    /// simply refused with `invalidTicket`, and nothing appears at either end
+    /// saying which ticket it was. `d` did that on one keypress, next to `u`
+    /// and `y`, which copy.
+    ConfirmDeleteTicket { ticket_id: String },
+}
+
+impl VettingMode {
+    /// The value of the focused field, when that field takes text.
+    #[must_use]
+    pub fn focused_text(&self) -> Option<&str> {
+        match self {
+            VettingMode::NewApplication {
+                community,
+                field: 0,
+                ..
+            } => Some(community),
+            VettingMode::RequestVetter { entry, .. } => Some(entry),
+            VettingMode::ConfirmDecline {
+                message, field: 1, ..
+            } => Some(message),
+            VettingMode::Directory(view) => view.text().map(String::as_str),
+            VettingMode::Profile(form) => match &form.event {
+                Some(event) => event.text().map(String::as_str),
+                None => form.text().map(String::as_str),
+            },
+            // Only while a field has focus — the name, or a required value
+            // being typed: on a row to choose or tick, space has to reach
+            // `Toggle` rather than being typed into a field.
+            VettingMode::NewFace(form) => form.text().map(String::as_str),
+            _ => None,
+        }
+    }
+
+    /// The focused text field, to edit.
+    pub fn focused_text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            VettingMode::NewApplication {
+                community,
+                field: 0,
+                ..
+            } => Some(community),
+            VettingMode::RequestVetter { entry, .. } => Some(entry),
+            VettingMode::ConfirmDecline {
+                message, field: 1, ..
+            } => Some(message),
+            VettingMode::Directory(view) => view.text_mut(),
+            VettingMode::Profile(form) => form.focused_text_mut(),
+            VettingMode::NewFace(form) => form.text_mut(),
+            _ => None,
+        }
+    }
+}
+
+/// A community whose vetter directory can be searched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryCommunity {
+    pub community: String,
+    pub name: String,
+    pub accent: Option<(u8, u8, u8)>,
+    /// The persona the list request is sent as: the application's, else the
+    /// membership's.
+    pub persona: PersonaId,
+    /// Our application to it, if any — the one a request from here goes into.
+    pub application_id: Option<String>,
+}
+
+/// The vetter directory, while it is open. Results are page state only: they
+/// describe other people and go stale, so none of it is saved.
+#[derive(Clone, Debug, Default)]
+pub struct DirectoryView {
+    /// Index into [`VettingState::directory_communities`].
+    pub community_index: usize,
+    pub filter: DirectoryFilter,
+    /// Index into [`DIRECTORY_METHODS`].
+    pub method_index: usize,
+    /// `0..DIRECTORY_FIELDS` are the filters; past them, a result row.
+    pub field: usize,
+    pub results: Vec<ListedVetterRow>,
+    /// The cursor each page shown so far was fetched with; the last is the
+    /// current page's. Its length is the page number.
+    pub cursors: Vec<Option<String>>,
+    /// The community's cursor for the page after this one.
+    pub next_cursor: Option<String>,
+    /// The list request waiting for its answer.
+    pub pending: Option<String>,
+    /// What `cursors` becomes when that answer arrives.
+    pub pending_cursors: Option<Vec<Option<String>>>,
+    /// A search has been answered at least once.
+    pub searched: bool,
+    /// Why the last search failed.
+    pub error: Option<String>,
+}
+
+impl DirectoryView {
+    /// The highlighted result, when a result row has the focus.
+    #[must_use]
+    pub fn result_index(&self) -> Option<usize> {
+        self.field
+            .checked_sub(DIRECTORY_FIELDS)
+            .filter(|i| *i < self.results.len())
+    }
+
+    /// Rows the focus moves through: the filters, then the results.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        DIRECTORY_FIELDS + self.results.len()
+    }
+
+    fn text(&self) -> Option<&String> {
+        let f = &self.filter;
+        match self.field {
+            1 => Some(&f.language),
+            2 => Some(&f.country),
+            3 => Some(&f.region),
+            4 => Some(&f.city),
+            6 => Some(&f.event_from),
+            7 => Some(&f.event_to),
+            8 => Some(&f.event_name),
+            _ => None,
+        }
+    }
+
+    fn text_mut(&mut self) -> Option<&mut String> {
+        let f = &mut self.filter;
+        match self.field {
+            1 => Some(&mut f.language),
+            2 => Some(&mut f.country),
+            3 => Some(&mut f.region),
+            4 => Some(&mut f.city),
+            6 => Some(&mut f.event_from),
+            7 => Some(&mut f.event_to),
+            8 => Some(&mut f.event_name),
+            _ => None,
+        }
+    }
+}
+
+/// One listed vetter, ready to show. Every string is already sanitised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedVetterRow {
+    pub did: String,
+    /// The name they published, or their DID when they published none.
+    pub name: String,
+    pub languages: String,
+    pub location: Option<String>,
+    pub methods: String,
+    pub documentation: String,
+    pub availability: Option<String>,
+    /// How to get a ticket from them.
+    pub contact_hint: Option<String>,
+    /// Upcoming events, one line each.
+    pub events: Vec<String>,
+    /// When their grant runs out.
+    pub grant_until: String,
+}
+
+/// The vetter profile form.
+#[derive(Clone, Debug)]
+pub struct VetterProfileForm {
+    /// Index into [`VettingState::memberships`] — communities that named us a
+    /// vetter.
+    pub membership_index: usize,
+    pub draft: ProfileDraft,
+    /// `0..PROFILE_FIELDS` are the fields; then one row per event; then "add an
+    /// event".
+    pub field: usize,
+    /// The event being added or edited, while its form is open.
+    pub event: Option<EventForm>,
+    /// Why the profile cannot be sent as it stands.
+    pub error: Option<String>,
+    /// Where the community stands on what was last sent, and whether that is
+    /// good news.
+    pub state_line: Option<(LineTone, String)>,
+}
+
+impl VetterProfileForm {
+    /// Rows the focus moves through.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        PROFILE_FIELDS + self.draft.events.len() + 1
+    }
+
+    /// The event under the focus.
+    #[must_use]
+    pub fn event_index(&self) -> Option<usize> {
+        self.field
+            .checked_sub(PROFILE_FIELDS)
+            .filter(|i| *i < self.draft.events.len())
+    }
+
+    /// Whether the focus is on "add an event".
+    #[must_use]
+    pub fn on_add_event(&self) -> bool {
+        self.field == PROFILE_FIELDS + self.draft.events.len()
+    }
+
+    fn text(&self) -> Option<&String> {
+        let d = &self.draft;
+        match self.field {
+            2 => Some(&d.display_name),
+            3 => Some(&d.languages),
+            4 => Some(&d.country),
+            5 => Some(&d.region),
+            6 => Some(&d.city),
+            10 => Some(&d.accepts_documentation),
+            11 => Some(&d.availability),
+            12 => Some(&d.contact_hint),
+            _ => None,
+        }
+    }
+
+    /// The focused text field: the open event's, else the profile's.
+    fn focused_text_mut(&mut self) -> Option<&mut String> {
+        if self.event.is_some() {
+            return self.event.as_mut().and_then(EventForm::text_mut);
+        }
+        self.text_mut()
+    }
+
+    fn text_mut(&mut self) -> Option<&mut String> {
+        let d = &mut self.draft;
+        match self.field {
+            2 => Some(&mut d.display_name),
+            3 => Some(&mut d.languages),
+            4 => Some(&mut d.country),
+            5 => Some(&mut d.region),
+            6 => Some(&mut d.city),
+            10 => Some(&mut d.accepts_documentation),
+            11 => Some(&mut d.availability),
+            12 => Some(&mut d.contact_hint),
+            _ => None,
+        }
+    }
+}
+
+/// An event being added (`index` is `None`) or edited.
+#[derive(Clone, Debug, Default)]
+pub struct EventForm {
+    pub index: Option<usize>,
+    pub draft: EventDraft,
+    pub field: usize,
+    pub error: Option<String>,
+}
+
+impl EventForm {
+    fn text(&self) -> Option<&String> {
+        let d = &self.draft;
+        match self.field {
+            0 => Some(&d.name),
+            1 => Some(&d.start_date),
+            2 => Some(&d.end_date),
+            3 => Some(&d.country),
+            4 => Some(&d.region),
+            5 => Some(&d.city),
+            6 => Some(&d.url),
+            _ => None,
+        }
+    }
+
+    fn text_mut(&mut self) -> Option<&mut String> {
+        let d = &mut self.draft;
+        match self.field {
+            0 => Some(&mut d.name),
+            1 => Some(&mut d.start_date),
+            2 => Some(&mut d.end_date),
+            3 => Some(&mut d.country),
+            4 => Some(&mut d.region),
+            5 => Some(&mut d.city),
+            6 => Some(&mut d.url),
+            _ => None,
+        }
+    }
+}
+
+/// A face an application can wear.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaceChoice {
+    pub profile_id: String,
+    pub name: String,
+    pub entries: usize,
+    /// Worn in the application's context now.
+    pub worn: bool,
+    /// The claim types this face would disclose, in the order it resolves
+    /// them. Empty when the read that would have said failed — a face whose
+    /// contents could not be read is shown without them rather than hidden.
+    pub claim_types: Vec<String>,
+}
+
+/// What a card would show, as the VTA previewed it. Nothing has left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardPreview {
+    /// Single use, and short-lived.
+    pub preview_id: String,
+    /// Claim type and value, as the card would carry them.
+    pub claims: Vec<(String, String)>,
+    /// Why this face cannot make the card, when it cannot.
+    pub problem: Option<String>,
+}
+
+/// The vetter's checklist (design §9.3).
+#[derive(Clone, Debug, Default)]
+pub struct AttestForm {
+    pub field: usize,
+    pub method_index: usize,
+    pub documentation_index: usize,
+    pub relationship_index: usize,
+    /// We read the match code to each other.
+    pub liveness_confirmed: bool,
+    /// The vetter has read the attestation and stands behind it.
+    pub attested: bool,
+}
+
+impl AttestForm {
+    /// Method, documentation, relationship, match code, attestation.
+    pub const FIELDS: usize = 5;
+}
+
+/// One application, for display.
+#[derive(Clone, Debug)]
+pub struct ApplicationRow {
+    pub id: String,
+    pub community: String,
+    pub community_name: Option<String>,
+    /// The community's published accent colour.
+    pub accent: Option<(u8, u8, u8)>,
+    /// This application's vetting is proven with a PCS zero-knowledge proof:
+    /// the community will not learn who the vetters were.
+    pub pcs_zkp: bool,
+    /// What to do next, with the key that does it.
+    pub next_step: Option<String>,
+    pub join_did: String,
+    /// What the community requires, in a line; `None` until its manifest arrives.
+    pub requirements: Option<String>,
+    /// The criterion it gathers for and the path it takes, in words, with a note when one is
+    /// owed — a criterion re-picked, or named vetting chosen where PCS ZKP is on offer.
+    pub criterion: Option<(String, Option<String>)>,
+    /// Progress against those requirements.
+    pub progress: Option<String>,
+    pub satisfied: bool,
+    /// The face shown to vetters, once chosen. From the application rather
+    /// than from `worn_faces`, which only holds what this run has read.
+    pub face: Option<String>,
+    /// Claim type and the value we show vetters (empty when not set).
+    pub identity: Vec<(String, String)>,
+    pub requests: Vec<RequestRow>,
+    pub statements: usize,
+}
+
+/// One request to a vetter, for display.
+#[derive(Clone, Debug)]
+pub struct RequestRow {
+    pub vetter: String,
+    pub vetter_name: Option<String>,
+    pub state: String,
+    pub match_code: Option<String>,
+    /// The open session still waiting for our card.
+    pub card_session: Option<String>,
+    /// What their acceptance showed of their eligibility, and whether that is
+    /// good news.
+    pub eligibility: Option<(bool, String)>,
+    /// Whether the community has since revoked their grant.
+    pub grant: Option<(LineTone, String)>,
+    /// Why a refused request was refused, in words — kept off
+    /// [`state`](Self::state) because that is one unwrapped line, and this is a
+    /// sentence. The wire code alone (`vetting/request:invalidTicket`) told the
+    /// applicant nothing they could act on.
+    pub refusal: Option<String>,
+}
+
+/// Where a desk request is, for choosing what the keys do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeskStage {
+    Accepted,
+    Session,
+    Card,
+    Closed,
+}
+
+/// One request at our desk, for display.
+#[derive(Clone, Debug)]
+pub struct DeskRow {
+    pub request_id: String,
+    pub applicant: String,
+    pub applicant_name: Option<String>,
+    pub community: String,
+    /// The community proves vetting with a PCS zero-knowledge proof, so an
+    /// attestation for it is counted without naming this vetter.
+    pub pcs_zkp: bool,
+    /// For a PCS ZKP community, where this vetter stands for attesting there: the tokens held
+    /// and when that changes. Shown on the attest form beside the PCS ZKP line.
+    pub pcs_tokens: Option<String>,
+    /// The community runs events a vetter can ask to vet at for more tokens (`e`).
+    pub pcs_events: bool,
+    pub state: String,
+    pub stage: DeskStage,
+    pub method: Option<String>,
+    pub match_code: Option<String>,
+    /// What their card showed, while we still hold it.
+    pub claims: Vec<(String, String)>,
+    pub required_claims: Vec<String>,
+    pub message: Option<String>,
+}
+
+/// One ticket, for display.
+#[derive(Clone, Debug)]
+pub struct TicketRow {
+    pub id: String,
+    pub code: String,
+    pub community: String,
+    pub uses_left: u32,
+    pub expires: String,
+    pub live: bool,
+    /// The `vetting-ticket:` link its QR code carries, when the persona it
+    /// admits requests to is available.
+    pub uri: Option<String>,
+    /// "issued under named vetting", when the ticket was issued under a mode other than the one
+    /// its community runs now.
+    pub mode_note: Option<String>,
+}
+
+/// One statement we signed, for display.
+#[derive(Clone, Debug)]
+pub struct IssuedRow {
+    pub id: String,
+    pub applicant: String,
+    pub community: String,
+    pub method: String,
+    pub issued: String,
+    pub valid_until: String,
+    pub withdrawal: Option<String>,
+    /// The community has recorded the withdrawal. Until it has — including
+    /// after it refused one — sending it again is allowed: withdrawal
+    /// converges.
+    pub withdrawal_recorded: bool,
+}
+
+/// A persona an application can use.
+#[derive(Clone, Debug)]
+pub struct VettingPersona {
+    pub persona: PersonaId,
+    pub did: String,
+    pub label: String,
+}
+
+/// A community we can vet for.
+#[derive(Clone, Debug)]
+pub struct VettingMembership {
+    pub community: String,
+    pub name: String,
+    pub persona: PersonaId,
+    pub accent: Option<(u8, u8, u8)>,
+}
+
+// ****************************************************************************
+// Inbox State
+// ****************************************************************************
+
+/// State for the inbox/tasks panel.
+#[derive(Clone, Debug, Default)]
+pub struct InboxState {
+    /// Display summaries of all pending tasks. `Arc<[…]>` for cheap per-frame
+    /// clones; rebuilt wholesale in `sync_from_config`.
+    pub tasks: Arc<[TaskSummary]>,
+    /// Currently selected task index in the list
+    pub selected_index: usize,
+    /// When viewing a specific task's details
+    pub active_task: Option<ActiveTaskView>,
+    /// Transient status message (e.g., "Task accepted", "Error: ...")
+    pub status_message: Option<String>,
+    /// When `Some`, a destructive inbox action (dismiss one task, or clear all)
+    /// is awaiting `y`/`n` confirmation; the panel shows a prompt and other keys
+    /// are suppressed. Mirrors the Communities/VTA-DID confirm pattern (R25).
+    pub confirm: Option<InboxConfirm>,
+}
+
+/// A pending destructive inbox action awaiting `y`/`n` confirmation (R25).
+#[derive(Clone, Debug)]
+pub enum InboxConfirm {
+    /// Dismiss a single task (by id) — armed from the list or a task detail.
+    Dismiss { task_id: String },
+    /// Clear every pending task.
+    ClearAll,
+}
+
+/// Lightweight display summary of a task (no Arc/Mutex).
+#[derive(Clone, Debug)]
+pub struct TaskSummary {
+    /// Task ID
+    pub id: String,
+    /// Human-friendly type description (e.g., "Relationship Request (Inbound)")
+    pub type_display: String,
+    /// Categorization for UI rendering and action dispatch
+    pub kind: TaskKind,
+    /// Shortened DID of the remote party (if applicable)
+    pub remote_did: String,
+    /// Verified agent name for exactly the DID held in
+    /// [`remote_did`](Self::remote_did), if one is cached — shown in its place.
+    /// Only ever sourced from `Config::agent_name_for` (verified, round-tripped
+    /// lookups); it outranks the requester-supplied `name` on an inbound
+    /// relationship request, which is self-asserted and therefore spoofable.
+    pub remote_agent_name: Option<String>,
+    /// Formatted creation timestamp
+    pub created: String,
+}
+
+/// Categorizes tasks for UI rendering and determining available actions.
+#[derive(Clone, Debug)]
+// Some variant fields (e.g. `Informational(String)`) are populated but not yet
+// read by the UI — kept for future detail-view rendering.
+#[allow(dead_code)]
+pub enum TaskKind {
+    /// Inbound relationship request awaiting accept/reject
+    RelationshipRequestInbound {
+        from_did: String,
+        their_did: String,
+        reason: Option<String>,
+        /// Friendly name of the requester (if provided)
+        name: Option<String>,
+    },
+    /// Outbound relationship request awaiting response
+    RelationshipRequestOutbound {
+        our_did: String,
+        /// Verified agent name for `our_did`, if cached. `None` when we sent the
+        /// request from a generated R-DID (a pseudonym, which carries no name).
+        our_agent_name: Option<String>,
+    },
+    /// Inbound VRC request awaiting accept/reject
+    VRCRequestInbound { reason: Option<String> },
+    /// Outbound VRC request awaiting response
+    VRCRequestOutbound,
+    /// A VRC was issued to us, awaiting acceptance
+    VRCIssued,
+    /// Trust ping awaiting pong
+    TrustPing,
+    /// Informational task (accepted, rejected, finalized, etc.)
+    Informational(String),
+    /// A step in a vetting exchange that waits on us. Opening it goes to the
+    /// page where that step is taken, rather than to a detail view that could
+    /// only say it exists.
+    Vetting(VettingTarget),
+}
+
+/// What a journey page follows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JourneyTarget {
+    /// An application, by id.
+    Application(String),
+    /// A request on the vetter's desk, by request id.
+    Desk(String),
+}
+
+/// A journey, ready to draw.
+#[derive(Clone, Debug)]
+pub struct JourneyView {
+    /// "Applying to first-vtc as alice", "Vetting did:… for first-vtc".
+    pub title: String,
+    /// The community proves vetting with a PCS zero-knowledge proof.
+    pub pcs_zkp: bool,
+    pub steps: JourneySteps,
+}
+
+/// The steps of whichever side the journey is.
+#[derive(Clone, Debug)]
+pub enum JourneySteps {
+    Applicant(
+        Vec<
+            openvtc_core::vetting::journey::JourneyStep<
+                openvtc_core::vetting::journey::ApplicantStep,
+            >,
+        >,
+    ),
+    Vetter(
+        Vec<
+            openvtc_core::vetting::journey::JourneyStep<openvtc_core::vetting::journey::VetterStep>,
+        >,
+        Option<openvtc_core::vetting::journey::VetterEnding>,
+    ),
+}
+
+/// Where a vetting task is acted on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VettingTarget {
+    /// Applicant: an application, and the session whose card is now due.
+    Card {
+        application_id: String,
+        session_id: String,
+    },
+    /// Vetter: a request on the desk.
+    Desk { request_id: String },
+}
+
+/// Detailed view of a specific task for the interaction screen.
+///
+/// Every `*_agent_name` is the **verified** name for exactly the DID in the
+/// field it sits beside (from `Config::agent_name_for`), so rendering the name
+/// in place of that DID never relabels a different identity. `their_did` — the
+/// requester's relationship DID — has no name field on purpose: an R-DID is a
+/// per-relationship pseudonym, deliberately not a stable named identity.
+#[derive(Clone, Debug)]
+pub enum ActiveTaskView {
+    RelationshipRequestInbound {
+        task_id: String,
+        from_did: String,
+        from_agent_name: Option<String>,
+        their_did: String,
+        reason: Option<String>,
+        name: Option<String>,
+    },
+    /// Outbound relationship request — waiting for response
+    RelationshipRequestOutbound {
+        task_id: String,
+        to_did: String,
+        to_agent_name: Option<String>,
+        our_did: String,
+        our_agent_name: Option<String>,
+        state: String,
+    },
+    VRCRequestInbound {
+        task_id: String,
+        from_did: String,
+        from_agent_name: Option<String>,
+        reason: Option<String>,
+    },
+    /// Outbound VRC request — waiting for response
+    VRCRequestOutbound {
+        task_id: String,
+        remote_did: String,
+        remote_agent_name: Option<String>,
+    },
+    VRCIssued {
+        task_id: String,
+        issuer: String,
+        issuer_agent_name: Option<String>,
+    },
+    /// Generic info task (ping, pong, informational)
+    Info {
+        task_id: String,
+        type_display: String,
+        remote_did: String,
+        remote_agent_name: Option<String>,
+    },
+}
+
+// ****************************************************************************
+// Relationships State
+// ****************************************************************************
+
+/// State for the relationships panel.
+#[derive(Clone, Debug, Default)]
+pub struct RelationshipsState {
+    /// Display summaries of all relationships. `Arc<[…]>` for cheap per-frame
+    /// clones; rebuilt wholesale in `sync_from_config`.
+    pub relationships: Arc<[RelationshipSummary]>,
+    /// Currently selected index in the list
+    pub selected_index: usize,
+    /// Current panel mode (list, detail, new request form)
+    pub mode: RelationshipsMode,
+    /// Transient status message
+    pub status_message: Option<String>,
+    /// When `Some(remote_p_did)`, removal of that relationship is awaiting
+    /// `y`/`n` confirmation (armed from the detail view). Mirrors the
+    /// Communities/VTA-DID confirm pattern (R25).
+    pub confirm_delete: Option<String>,
+}
+
+/// Display modes for the relationships panel.
+#[derive(Clone, Debug, Default)]
+pub enum RelationshipsMode {
+    /// Browsing the list of relationships
+    #[default]
+    List,
+    /// Viewing details of a specific relationship.
+    /// `selected_vrc`: None = relationship info shown, Some(n) = VRC at index n expanded.
+    Detail {
+        index: usize,
+        selected_vrc: Option<usize>,
+    },
+    /// Editing the alias for an existing relationship
+    EditAlias { index: usize, alias_input: String },
+    /// Naming the witness to have the relationship at `index` witnessed by.
+    ///
+    /// `share_membership` is the member's explicit choice, for this one witnessing, to present
+    /// their membership credential — and so let this witness learn which community member is
+    /// behind the relationship. Off whenever the prompt opens; never remembered.
+    Witness {
+        index: usize,
+        witness_input: String,
+        share_membership: bool,
+    },
+    /// Filling out a new relationship request form
+    NewRequest {
+        did_input: String,
+        alias_input: String,
+        reason_input: String,
+        /// Whether to generate a random relationship DID (privacy)
+        generate_r_did: bool,
+        /// The working community's declared `relationshipIdentifierDefault`, if
+        /// any — what seeded [`generate_r_did`](Self::NewRequest::generate_r_did).
+        /// Carried only so the form can explain *why* the toggle defaulted where
+        /// it did ("your community prefers …"); `None` when there is no working
+        /// community or it declared nothing (issue #241 follow-up).
+        community_default: Option<RelationshipIdentifierDefault>,
+        /// Which form field is currently focused (0=DID, 1=Alias, 2=Reason, 3=R-DID toggle)
+        active_field: usize,
+    },
+}
+
+/// Lightweight display summary of a relationship.
+#[derive(Clone, Debug)]
+pub struct RelationshipSummary {
+    /// Remote party's persona DID
+    pub remote_p_did: String,
+    /// Contact alias (if set)
+    pub alias: Option<String>,
+    /// Verified agent name for the remote persona DID (`example.com/@bob`), if
+    /// one is cached. Shown when there is no user alias; the DID is the last
+    /// resort. Populated in `sync_from_config` from the persisted cache.
+    pub agent_name: Option<String>,
+    /// Human-readable state (e.g., "Established", "Request Sent")
+    pub state: String,
+    /// Our DID used in this relationship
+    pub our_did: String,
+    /// Remote party's DID for this relationship
+    pub remote_did: String,
+    /// Formatted creation timestamp
+    pub created: String,
+    /// VRCs we issued to this party
+    pub vrcs_issued: Vec<RelationshipVrc>,
+    /// VRCs we received from this party
+    pub vrcs_received: Vec<RelationshipVrc>,
+    /// Witnessings of this relationship, oldest first.
+    pub witnessings: Vec<RelationshipWitnessing>,
+    /// Whether this relationship's R-DID keys were lost and could not be
+    /// recovered at load (see `Relationship::needs_reestablishment`). When set,
+    /// the list shows a "needs re-establishment" badge: the relationship can no
+    /// longer send or receive and must be re-created.
+    pub needs_reestablishment: bool,
+}
+
+/// A completed witnessing, for the relationship detail view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationshipWitnessing {
+    /// The witness's DID.
+    pub witness: String,
+    /// Its verified agent name, if one is cached.
+    pub witness_agent_name: Option<String>,
+    /// The witness credential's handle in the VTA's credential vault.
+    pub credential_id: String,
+    /// When it completed, formatted.
+    pub witnessed_at: String,
+}
+
+/// VRC info for display in the relationship detail view.
+///
+/// Carries the same issuer/subject name pair as [`VrcSummary`] — the credentials
+/// panel and this list show the same credentials from two different screens, so
+/// they resolve names identically (verified-only, via `Config::agent_name_for`).
+#[derive(Clone, Debug)]
+pub struct RelationshipVrc {
+    /// Issuer DID (shortened for display)
+    pub issuer: String,
+    /// Verified agent name for the issuer DID, if cached. Shown in place of
+    /// [`issuer`](Self::issuer) on the list row; the expanded detail keeps
+    /// [`issuer_full`](Self::issuer_full) so the DID is still readable/copyable.
+    pub issuer_agent_name: Option<String>,
+    /// Full issuer DID
+    pub issuer_full: String,
+    /// Subject DID (shortened for display)
+    pub subject: String,
+    /// Verified agent name for the subject DID, if cached. Same treatment as
+    /// [`issuer_agent_name`](Self::issuer_agent_name).
+    pub subject_agent_name: Option<String>,
+    /// Full subject DID
+    pub subject_full: String,
+    /// Formatted valid_from date
+    pub valid_from: String,
+    /// Formatted valid_until date (if set)
+    pub valid_until: Option<String>,
+    /// Raw credential source, pretty-printed lazily at detail-view time.
+    pub raw_json: RawCredential,
+}
+
+// ****************************************************************************
+// Credentials State
+// ****************************************************************************
+
+/// State for the credentials (VRCs) panel.
+#[derive(Clone, Debug, Default)]
+pub struct CredentialsState {
+    /// VRCs we received. `Arc<[…]>` for cheap per-frame clones.
+    pub received: Arc<[VrcSummary]>,
+    /// VRCs we issued. `Arc<[…]>` for cheap per-frame clones.
+    pub issued: Arc<[VrcSummary]>,
+    /// Membership (VMC) + role (VAC) credentials issued to us by the VTCs we've
+    /// joined, one or two entries per community (reuses [`VrcSummary`]).
+    /// `Arc<[…]>` for cheap per-frame clones.
+    pub membership: Arc<[VrcSummary]>,
+    /// Vetting statements we hold, across every application (reuses
+    /// [`VrcSummary`]). `Arc<[…]>` for cheap per-frame clones.
+    pub vetting: Arc<[VrcSummary]>,
+    /// Which tab is active
+    pub selected_tab: CredentialTab,
+    /// Currently selected index in the active tab's list
+    pub selected_index: usize,
+    /// Current panel mode
+    pub mode: CredentialsMode,
+    /// Transient status message
+    pub status_message: Option<String>,
+    /// Stored VRCs set aside on load because they pre-date DTG Credentials v1
+    /// ([`openvtc_core::vrc::Vrcs::retired`]), across every store. Shown as a
+    /// warning so the member knows to ask those peers for fresh ones.
+    pub retired_vrcs: usize,
+    /// When `Some(vrc_id)`, removal of that credential is awaiting `y`/`n`
+    /// confirmation (armed from the detail view). Mirrors the Communities/
+    /// VTA-DID confirm pattern (R25).
+    pub confirm_delete: Option<String>,
+}
+
+impl CredentialsState {
+    /// The list the selected tab shows.
+    #[must_use]
+    pub fn active_list(&self) -> &Arc<[VrcSummary]> {
+        match self.selected_tab {
+            CredentialTab::Received => &self.received,
+            CredentialTab::Issued => &self.issued,
+            CredentialTab::Membership => &self.membership,
+            CredentialTab::Vetting => &self.vetting,
+        }
+    }
+}
+
+/// Which credential tab is active.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CredentialTab {
+    #[default]
+    Received,
+    Issued,
+    /// Membership (VMC) + role (VAC) credentials issued to us by joined VTCs.
+    Membership,
+    /// Vetting statements (`vetted/1` VSCs) vetters issued to us.
+    Vetting,
+}
+
+impl CredentialTab {
+    /// Whether a credential on this tab can be removed locally. Membership,
+    /// role and vetting credentials are bound to a community or an
+    /// application, so there is no local-only removal for them.
+    #[must_use]
+    pub fn allows_local_removal(self) -> bool {
+        matches!(self, Self::Received | Self::Issued)
+    }
+}
+
+/// Display modes for the credentials panel.
+#[derive(Clone, Debug, Default)]
+pub enum CredentialsMode {
+    /// Browsing the list of credentials
+    #[default]
+    List,
+    /// Viewing details of a specific credential
+    Detail { index: usize },
+    /// Requesting a new VRC: selecting a relationship
+    NewRequest {
+        /// Index into the established relationships list
+        relationship_index: usize,
+        reason_input: String,
+    },
+}
+
+/// Lightweight display summary of a VRC.
+#[derive(Clone, Debug)]
+pub struct VrcSummary {
+    /// VRC identifier (proof value hash)
+    pub vrc_id: String,
+    /// Remote party's persona DID
+    pub remote_p_did: String,
+    /// Verified agent name for [`remote_p_did`](Self::remote_p_did), if cached.
+    /// Shown when there is no user alias; the DID is the last resort. Populated
+    /// in `sync_from_config` from the persisted (verified-only) cache.
+    pub remote_agent_name: Option<String>,
+    /// Raw credential source, pretty-printed lazily at detail-view time.
+    pub raw_json: RawCredential,
+    /// Contact alias (if set)
+    pub alias: Option<String>,
+    /// Issuer DID
+    pub issuer: String,
+    /// Verified agent name for [`issuer`](Self::issuer), if cached.
+    pub issuer_agent_name: Option<String>,
+    /// Subject DID
+    pub subject: String,
+    /// Verified agent name for [`subject`](Self::subject), if cached.
+    pub subject_agent_name: Option<String>,
+    /// Formatted valid_from date
+    pub valid_from: String,
+    /// Formatted valid_until date (if set)
+    pub valid_until: Option<String>,
+    /// What this credential asserts — "Membership", "Role" — when known.
+    ///
+    /// Previously only reachable by parsing it back out of [`alias`](Self::alias),
+    /// which packed `"<community> — <kind>"` into one string.
+    pub kind: Option<String>,
+    /// Whether the subject is one of this account's own personas, so the detail
+    /// view can say which side is you rather than leaving two names to compare.
+    pub subject_is_self: bool,
+    /// That persona's own label, when the subject is one of ours. What tells
+    /// two otherwise identical membership credentials apart: one per persona.
+    pub subject_label: Option<String>,
+    /// Signed with a post-quantum key as well as a classical one.
+    pub post_quantum: bool,
+    /// The validity window in human form, with a relative note — e.g.
+    /// `"22 Jul 2026 → 21 Aug 2026 · 29 days left"`.
+    ///
+    /// Composed where `chrono` and the current time are already at hand, so the
+    /// renderer stays free of date arithmetic.
+    pub validity: String,
+    /// One-word validity state for the header line: `valid`, `expired`, or
+    /// `not yet valid`. Derived from the window only — this is **not** a
+    /// revocation check, which needs the issuer's status list.
+    pub status: String,
+    /// A short note shown after the name in the list, when the name alone
+    /// does not say what the row is — a vetting statement's method and
+    /// community.
+    pub note: Option<String>,
+    /// Labelled facts shown in the detail view after the validity window, for
+    /// credentials whose meaning is in their body rather than their type —
+    /// how a vetter checked, and what they relied on.
+    pub facts: Vec<(&'static str, String)>,
+}
+
+// ****************************************************************************
+// Logs State
+// ****************************************************************************
+
+/// State for the logs panel.
+#[derive(Clone, Debug, Default)]
+pub struct LogsState {
+    /// Currently selected log entry index (0 = newest).
+    /// Managed locally by the UI component, not stored in State.
+    pub selected_index: usize,
+    /// When true, show the full text of the selected log entry.
+    pub detail_view: bool,
+}
+
+// ****************************************************************************
+// Settings State
+// ****************************************************************************
+
+/// State for the settings panel.
+#[derive(Clone, Debug, Default)]
+pub struct SettingsState {
+    /// Current friendly name
+    pub friendly_name: String,
+    /// Current mediator DID
+    pub mediator_did: String,
+    /// Persona DID (read-only display)
+    pub persona_did: String,
+    /// Verified agent name for the persona DID, if cached.
+    pub persona_agent_name: Option<String>,
+    /// How the config is protected (Token/Encrypted/Plaintext)
+    pub protection_type: String,
+    /// This account's top trust context at the agent (`top_context_id`).
+    ///
+    /// Display-only, and here for the wipe screen: that screen sends the
+    /// operator to `pnm contexts delete`, which takes the id positionally, and
+    /// once the profile is gone this pane was the last place the id appeared.
+    /// Empty when no account is loaded.
+    pub context_id: String,
+
+    /// Warning shown when this profile's secret is in a store that will not
+    /// keep it — the Linux kernel keyring, which is RAM-only. `None` when the
+    /// store is durable.
+    ///
+    /// Refreshed deliberately (at startup, and after a protection change) rather
+    /// than on every config sync: answering it means reading the credential back
+    /// out of the OS store, which is not something to do on every keystroke.
+    pub storage_warning: Option<String>,
+    /// Currently selected setting index
+    pub selected_index: usize,
+    /// Current panel mode
+    pub mode: SettingsMode,
+    /// Transient status message
+    pub status_message: Option<String>,
+    /// Hardware token management state
+    #[cfg(feature = "openpgp-card")]
+    pub token: TokenManagementState,
+    /// did-git-sign install info, when this persona has been configured for
+    /// git commit signing. Surfaced on the Help/Status panel so the operator
+    /// can copy the SSH public key into their git host's signing-key
+    /// settings.
+    pub did_git_sign: Option<DidGitSignInfo>,
+}
+
+/// Snapshot of the local did-git-sign install for this persona.
+#[derive(Clone, Debug)]
+pub struct DidGitSignInfo {
+    /// Verification method id from the SigningConfig file.
+    pub did_key_id: String,
+    /// Persona signing public key formatted as `ssh-ed25519 AAAA…`.
+    pub ssh_public_key: String,
+    /// Filesystem path to the SigningConfig the install wrote.
+    pub config_path: String,
+}
+
+/// Hardware token management state.
+#[cfg(feature = "openpgp-card")]
+#[derive(Clone, Debug, Default)]
+pub struct TokenManagementState {
+    /// Number of detected tokens
+    pub detected_count: usize,
+    /// Status messages from token operations
+    pub messages: Vec<String>,
+    /// Whether a factory reset was completed
+    pub reset_completed: bool,
+}
+
+/// Display modes for the settings panel.
+#[derive(Clone, Debug, Default)]
+pub enum SettingsMode {
+    /// Viewing settings list
+    #[default]
+    View,
+    /// Editing the friendly name
+    EditFriendlyName { input: String },
+    /// Export config form (path + passphrase length for masked display)
+    ExportConfig {
+        path_input: String,
+        /// Length of the passphrase (actual value held only in UI component)
+        passphrase_len: usize,
+        active_field: usize,
+    },
+    /// Import config form (path + passphrase length for masked display)
+    ImportConfig {
+        path_input: String,
+        /// Length of the passphrase (actual value held only in UI component)
+        passphrase_len: usize,
+        active_field: usize,
+    },
+    /// Changing protection level (set/remove passphrase)
+    ChangeProtection {
+        /// 0 = Set passphrase, 1 = Remove passphrase (keyring only)
+        selected_option: usize,
+        /// Length of the passphrase (actual value held only in UI component)
+        passphrase_len: usize,
+        /// Length of the confirm passphrase (actual value held only in UI component)
+        confirm_len: usize,
+        /// Which field is active (0 = option list, 1 = passphrase, 2 = confirm)
+        active_field: usize,
+    },
+    /// Token management sub-screen
+    #[cfg(feature = "openpgp-card")]
+    TokenManagement { selected_index: usize },
+    /// Wipe-profile confirmation. Operator must type the literal token
+    /// `WIPE` (case-insensitive) into `confirm_input` before the wipe is
+    /// permitted to proceed. Anything else just closes the dialog.
+    WipeConfirm {
+        /// Live text the operator is typing into the confirm field.
+        confirm_input: String,
+    },
+    /// Choosing a theme. The highlighted theme is previewed on the whole
+    /// screen; `original` is put back if the choice is cancelled.
+    ThemePicker {
+        rows: Vec<ThemeRow>,
+        selected: usize,
+        original: String,
+    },
+}
+
+/// A theme on the picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThemeRow {
+    pub id: String,
+    pub name: String,
+    /// Where it comes from, in a word or two.
+    pub source: String,
+}
+
+#[cfg(test)]
+mod vetting_label_tests {
+    use super::*;
+    use openvtc_core::vetting::book::VetterPolicy;
+    use openvtc_core::vetting::registry::{DraftError, EventDraft, ProfileDraft};
+
+    /// The rows a refused profile can name all resolve, and to the row the form
+    /// actually draws there. Pinned by index: these tables are what both the
+    /// renderer and the cursor jump read, so a row inserted without moving the
+    /// form's own `f == n` comparisons would put the cursor one row off.
+    #[test]
+    fn every_profile_row_a_refusal_names_resolves_to_its_own_row() {
+        assert_eq!(row_of(&PROFILE_LABELS, "Display name"), Some(2));
+        assert_eq!(row_of(&PROFILE_LABELS, "Languages"), Some(3));
+        assert_eq!(row_of(&PROFILE_LABELS, "Country"), Some(4));
+        assert_eq!(row_of(&PROFILE_LABELS, "Region"), Some(5));
+        assert_eq!(row_of(&PROFILE_LABELS, "City"), Some(6));
+        assert_eq!(
+            row_of(&PROFILE_LABELS, "I vet"),
+            Some(7),
+            "the three method ticks share one label, printed against the first"
+        );
+        assert_eq!(row_of(&PROFILE_LABELS, "Documents I accept"), Some(10));
+        assert_eq!(row_of(&PROFILE_LABELS, "Availability"), Some(11));
+        assert_eq!(row_of(&PROFILE_LABELS, "How to get a ticket"), Some(12));
+
+        assert_eq!(row_of(&EVENT_LABELS, "Name"), Some(0));
+        assert_eq!(row_of(&EVENT_LABELS, "First day"), Some(1));
+        assert_eq!(row_of(&EVENT_LABELS, "Last day"), Some(2));
+        assert_eq!(row_of(&EVENT_LABELS, "Web page"), Some(6));
+
+        assert_eq!(row_of(&DIRECTORY_LABELS, "Language"), Some(1));
+        assert_eq!(row_of(&DIRECTORY_LABELS, "Country"), Some(2));
+        assert_eq!(row_of(&DIRECTORY_LABELS, "Events from"), Some(6));
+        assert_eq!(row_of(&DIRECTORY_LABELS, "Events until"), Some(7));
+        assert_eq!(row_of(&DIRECTORY_LABELS, "Event name"), Some(8));
+
+        assert_eq!(
+            row_of(&PROFILE_LABELS, ""),
+            None,
+            "the unlabelled method rows are not a row anything can jump to"
+        );
+    }
+
+    /// What the form would actually do with a real refusal: the message names a
+    /// row, and that row resolves. The pair is the whole feature — a message
+    /// naming a row the cursor cannot find is the bug this pins shut.
+    #[test]
+    fn a_refused_profile_names_a_row_the_form_can_find() {
+        let mut draft = ProfileDraft::new(&VetterPolicy::default());
+        draft.toggle_method(VettingMethod::InPerson);
+        draft.country = "USA".into();
+        let e = draft.to_body().unwrap_err();
+        assert_eq!(e.row().and_then(|l| row_of(&PROFILE_LABELS, l)), Some(4));
+        assert!(e.to_string().starts_with("Country:"));
+
+        // An event's rows are the event form's. Resolving its label against the
+        // profile would land on the profile's own "Country" — a different row
+        // than the message is about, and the reason events are wrapped.
+        let mut draft = ProfileDraft::new(&VetterPolicy::default());
+        draft.toggle_method(VettingMethod::InPerson);
+        draft.events = vec![EventDraft {
+            name: "Linux Plumbers".into(),
+            start_date: "2026-10-05".into(),
+            end_date: "2026-10-07".into(),
+            country: "Czechia".into(),
+            ..EventDraft::default()
+        }];
+        let e = draft.to_body().unwrap_err();
+        assert_eq!(e.event(), Some(0), "the profile's first event row");
+        assert_eq!(e.row(), None, "no profile row is at fault");
+        assert!(
+            matches!(&e, DraftError::Event { source, .. } if source.row() == Some("Country")),
+            "the event form still gets its own row: {e}"
+        );
+    }
+}

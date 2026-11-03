@@ -1,0 +1,1196 @@
+#[cfg(feature = "openpgp-card")]
+use crate::cli::get_user_pin;
+use crate::colors::{CLI_CAUTION, CLI_ERROR, CLI_EXAMPLE, CLI_INFO, Themed};
+use crate::{
+    cli::cli,
+    state_handler::{DeferredLoad, StartingMode, StateHandler},
+    ui::UiManager,
+};
+use anyhow::{Result, bail};
+use console::style;
+use dialoguer::{Confirm, Password, theme::ColorfulTheme};
+use openvtc_core::{
+    config::{Config, ConfigProtectionType, UnlockCode, public_config::PublicConfig},
+    errors::OpenVTCError,
+    process_lock::{check_duplicate_instance, remove_lock_file},
+    secure_store::{Durability, StoreDescription},
+};
+#[cfg(feature = "openpgp-card")]
+use secrecy::SecretString;
+use std::env;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+#[cfg(unix)]
+use tokio::signal::unix::signal;
+use tokio::sync::broadcast;
+
+mod cli;
+mod clipboard;
+mod colors;
+mod env_overrides;
+mod headless;
+mod health_cmd;
+mod holder_grant;
+mod repos_cmd;
+mod setup_cmd;
+mod signing_cmd;
+mod state_handler;
+mod theme;
+mod theme_cmd;
+mod ui;
+
+/// Load the full account for `openvtc health`, or `None` if it cannot be had.
+///
+/// Every failure here is soft. A profile that does not exist, will not decrypt,
+/// or whose VTA is unreachable still leaves a useful report to run against the
+/// `--vtc` DIDs — and "the account would not load" is itself a finding worth
+/// printing rather than an error worth aborting on. The reason is surfaced on
+/// stderr so it is not swallowed.
+///
+/// The admin VTA session `load_step2` hands back is shut down immediately: this
+/// command reads DID documents, and holding a live mediator connection open for
+/// that would add a second socket for the profile the running TUI may already
+/// own.
+async fn load_config_for_health(
+    profile: &str,
+    unlock_code_arg: Option<&SuppliedUnlockCode>,
+) -> Option<Config> {
+    let deferred = match load_fast(profile, unlock_code_arg) {
+        Ok(deferred) => deferred,
+        Err(OpenVTCError::ConfigNotFound(_, _)) => return None,
+        Err(e) => {
+            eprintln!(
+                "{} {}",
+                style("Account not loaded:").themed(CLI_CAUTION),
+                redact_paths(&e.to_string()),
+            );
+            return None;
+        }
+    };
+
+    let mut tdk = match affinidi_tdk::TDK::new(
+        affinidi_tdk::common::config::TDKConfig::builder()
+            .with_load_environment(false)
+            .build()
+            .ok()?,
+        None,
+    )
+    .await
+    {
+        Ok(tdk) => tdk,
+        Err(e) => {
+            eprintln!(
+                "{} {e}",
+                style("Account not loaded (TDK init failed):").themed(CLI_CAUTION)
+            );
+            return None;
+        }
+    };
+
+    #[cfg(feature = "openpgp-card")]
+    struct TouchPrompt;
+    #[cfg(feature = "openpgp-card")]
+    impl openvtc_core::config::TokenInteractions for TouchPrompt {
+        fn touch_notify(&self) {
+            eprintln!("Touch your security token to continue…");
+        }
+        fn touch_completed(&self) {}
+    }
+
+    // `load_fast` hands back `None` when no card is in play, and `load_step2`
+    // still takes the argument it will not read: an empty secret, rather than a
+    // literal PIN standing in for one.
+    #[cfg(feature = "openpgp-card")]
+    let no_token_pin = SecretString::new(String::new().into());
+
+    match Config::load_step2(
+        &mut tdk,
+        profile,
+        deferred.public_config,
+        deferred.unlock_passphrase.as_ref(),
+        #[cfg(feature = "openpgp-card")]
+        deferred.user_pin.as_ref().unwrap_or(&no_token_pin),
+        #[cfg(feature = "openpgp-card")]
+        &TouchPrompt,
+        None,
+    )
+    .await
+    {
+        Ok((config, admin_session)) => {
+            if let Some(session) = admin_session {
+                session.shutdown().await;
+            }
+            Some(config)
+        }
+        Err(e) => {
+            eprintln!(
+                "{} {}",
+                style("Account not loaded:").themed(CLI_CAUTION),
+                redact_paths(&e.to_string()),
+            );
+            None
+        }
+    }
+}
+
+/// Environment variable that selects a non-default credential store.
+///
+/// Values: `file` (durable encrypted file, Linux) and `keyutils` (deprecated,
+/// migration only). **Absent is the only supported production configuration** —
+/// the OS-native store. Anything unrecognised is an error rather than a silent
+/// fall-through to the default: a typo here would otherwise put a profile's
+/// keys somewhere the user did not intend.
+const STORE_OVERRIDE_ENV: &str = "OPENVTC_SECURE_STORE";
+
+/// The message shown when the OS credential store cannot be opened.
+///
+/// Deliberately long. This is a hard stop, and a hard stop that does not say
+/// what to do instead is just a wall.
+fn no_secure_store_message(err: &keyring_core::Error) -> String {
+    let mut msg = format!(
+        "Could not open the OS credential store, so OpenVTC cannot read or write \
+         this profile's keys.\n\n  Reason: {err}\n\n"
+    );
+    if cfg!(target_os = "linux") {
+        msg.push_str(
+            "On Linux this means no Secret Service is reachable — no keyring daemon is \
+             running, or DBUS_SESSION_BUS_ADDRESS is not set (common over SSH and in \
+             containers).\n\n\
+             Fix it in one of these ways:\n\n\
+             \x20 1. Start a keyring daemon — gnome-keyring-daemon, kwalletd, KeePassXC \
+             or oo7-daemon — and make sure it is unlocked.\n\
+             \x20 2. If this is a headless machine with no keyring, choose file storage \
+             deliberately:\n\n\
+             \x20      OPENVTC_SECURE_STORE=file openvtc\n\n\
+             \x20    That stores your secrets in an encrypted file under the profile \
+             directory. It requires the profile to have a passphrase or a hardware \
+             token, so the key material is never written to disk in the clear.\n\n\
+             OpenVTC will NOT silently choose a weaker store for you. Where your keys \
+             live is your decision, not a side effect of what happened to be installed.\n",
+        );
+    } else {
+        msg.push_str(
+            "Unlock your login keychain and try again. If OpenVTC is running as a \
+             different user (via sudo, or a service account), that user has a different \
+             credential store.\n",
+        );
+    }
+    msg
+}
+
+/// Register the credential store as keyring-core's process default.
+///
+/// # Policy: fail closed
+///
+/// If the OS-native store cannot be opened, this **errors and OpenVTC exits**.
+/// It does not quietly write the keys somewhere else. A tool that silently
+/// downgrades its own storage teaches users that the secure backend is
+/// optional, and the moment it matters they discover their secrets were
+/// somewhere they never agreed to. Choosing file storage is a decision the
+/// operator makes explicitly, with [`STORE_OVERRIDE_ENV`].
+///
+/// # Policy: one implementation across the workspace
+///
+/// The default path delegates to [`vta_sdk::keyring_init::install_default_store`]
+/// — the same call `pnm-cli` makes — so `openvtc`, `pnm` and anything else on
+/// the SDK put secrets in the same store on the same OS: Apple Keychain,
+/// Windows Credential Manager, or DBus Secret Service. OpenVTC previously
+/// registered its own per-platform set and picked the Linux kernel keyring,
+/// which is RAM-only; that divergence is what made a reboot look like a
+/// corrupt install.
+///
+/// `profile` names the store entry in the diagnostics and locates the file
+/// store, so this runs *after* profile resolution.
+fn init_default_keyring_store(profile: &str) -> Result<()> {
+    let requested = std::env::var(STORE_OVERRIDE_ENV).unwrap_or_default();
+
+    match requested.as_str() {
+        // The supported configuration: whatever the OS provides, via the
+        // shared SDK helper.
+        "" => {
+            vta_sdk::keyring_init::install_default_store()
+                .map_err(|e| anyhow::anyhow!("{}", no_secure_store_message(&e)))?;
+            openvtc_core::secure_store::record_active(native_store_description(profile));
+            Ok(())
+        }
+
+        // Deliberate, durable file storage for machines with no keyring.
+        #[cfg(target_os = "linux")]
+        "file" => {
+            let dir = openvtc_core::secure_store::secrets_dir(profile)
+                .map_err(|e| anyhow::anyhow!("resolve secrets directory: {e}"))?;
+            let store = openvtc_core::secure_store::file::Store::new(
+                dir.clone(),
+                Some(openvtc_core::config::secured_config::require_encrypted_blob),
+            );
+            keyring_core::set_default_store(store);
+            openvtc_core::secure_store::record_active(StoreDescription {
+                label: "Encrypted file (chosen via OPENVTC_SECURE_STORE)".to_string(),
+                location: dir.display().to_string(),
+                durability: Durability::Durable,
+                inspect_hint: Some(format!("ls -l {}", dir.display())),
+            });
+            Ok(())
+        }
+
+        // Migration only. The kernel keyring cannot satisfy "durable", so it is
+        // not a supported place to keep a profile — it exists here so a user
+        // whose secrets are still in it from an older build can start once and
+        // export them.
+        #[cfg(target_os = "linux")]
+        "keyutils" => {
+            let store = linux_keyutils_keyring_store::Store::new()
+                .map_err(|e| anyhow::anyhow!("init linux keyutils store: {e}"))?;
+            keyring_core::set_default_store(store);
+            openvtc_core::secure_store::record_active(StoreDescription {
+                label: "Linux kernel keyring (DEPRECATED — migration only)".to_string(),
+                location: "kernel memory — NOT written to disk, lost on reboot".to_string(),
+                durability: Durability::UntilReboot,
+                inspect_hint: Some("keyctl show @us 2>/dev/null; keyctl show @s".to_string()),
+            });
+            eprintln!(
+                "{}",
+                style(
+                    "WARNING: OPENVTC_SECURE_STORE=keyutils stores your keys in kernel \
+                     memory. They are NOT on disk and are lost on reboot. This mode exists \
+                     only so you can recover an older profile: export a backup now \
+                     (Settings -> Export Config), then restart without the variable set."
+                )
+                .themed(CLI_CAUTION)
+            );
+            Ok(())
+        }
+
+        other => bail!(
+            "unknown {STORE_OVERRIDE_ENV}={other}. Leave it unset to use the OS \
+             credential store (the supported configuration). On Linux, `file` selects \
+             durable encrypted-file storage for machines with no keyring."
+        ),
+    }
+}
+
+/// Describe the OS-native store the SDK just registered, for diagnostics and
+/// `openvtc health`.
+fn native_store_description(profile: &str) -> StoreDescription {
+    #[cfg(target_os = "macos")]
+    {
+        StoreDescription {
+            label: "macOS Keychain".to_string(),
+            location: "login keychain (service \"openvtc\", account = profile name)".to_string(),
+            durability: Durability::Durable,
+            inspect_hint: Some(format!(
+                "security find-generic-password -s openvtc -a {profile}"
+            )),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        StoreDescription {
+            label: "Secret Service (GNOME Keyring / KWallet / KeePassXC)".to_string(),
+            location: "your login keyring, typically ~/.local/share/keyrings".to_string(),
+            durability: Durability::Durable,
+            inspect_hint: Some(format!(
+                "secret-tool search service openvtc username {profile}"
+            )),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = profile;
+        StoreDescription {
+            label: "Windows Credential Manager".to_string(),
+            location: "generic credential \"openvtc\" for the current user".to_string(),
+            durability: Durability::Durable,
+            inspect_hint: Some("cmdkey /list | findstr openvtc".to_string()),
+        }
+    }
+}
+
+/// Redact file system paths from error messages for user display.
+fn redact_paths(msg: &str) -> String {
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !home.is_empty() {
+        msg.replace(&home, "~")
+    } else {
+        msg.to_string()
+    }
+}
+
+/// Open the `OPENVTC_DEBUG_LOG` file for appending, owner-only on unix.
+///
+/// Append, never truncate. `File::create` truncated on every launch, so the
+/// evidence from a failed run was destroyed by the restart used to reproduce it
+/// — the exact workflow this variable exists to serve. Each run announces
+/// itself, so runs stay separable in one file.
+///
+/// Two things beyond a plain append:
+///
+/// * **Mode 0600.** Created with the process umask otherwise, which on a
+///   default `022` leaves a world-readable trace of DIDs, profile names and
+///   message metadata in whatever directory the operator named — often a shared
+///   `/tmp`. An already-existing file is tightened through the open handle, so
+///   a log left behind by an earlier, looser run does not stay readable.
+/// * **A symlink is refused.** Creating through a link planted in a
+///   world-writable directory would append this process's log to a file of the
+///   planter's choosing, so a symlink at `path` is an error, not a target.
+fn open_debug_log(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // `symlink_metadata` does not follow the final component, so this sees the
+    // link itself rather than what it points at. A missing path is the normal
+    // case: it is about to be created.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to write the debug log through a symlink",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+
+    // `mode` above applies only when the file is created. Tighten an existing
+    // one too, through the handle rather than the path, so there is no window
+    // between the check and the change.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(file)
+}
+
+/// Resolve the config profile from the `--profile` flag and the
+/// `OPENVTC_CONFIG_PROFILE` env var (the env wins, with a warning on a
+/// mismatch), then validate it.
+///
+/// The name is interpolated into lock-file, config and theme paths and used as
+/// the OS keyring account, so path separators and traversal are rejected before
+/// it reaches the filesystem. Factored out of `main` so it can run *before* the
+/// theme is chosen — the theme choice is scoped to the profile, so the profile
+/// has to be known first.
+fn resolve_profile(matches: &clap::ArgMatches) -> Result<String> {
+    let cli_profile = matches
+        .get_one::<String>("profile")
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+
+    let profile = if let Ok(env_profile) = env::var("OPENVTC_CONFIG_PROFILE") {
+        // ENV Profile will override the CLI Argument
+        if cli_profile != "default" && cli_profile != env_profile {
+            println!("{}",
+                style("WARNING: Using both ENV OPENVTC_CONFIG_PROFILE and CLI profile! These do not match!").themed(CLI_CAUTION)
+            );
+            println!(
+                "{} {}",
+                style("WARNING: Using CLI Profile:").themed(CLI_CAUTION),
+                style(&cli_profile).themed(CLI_EXAMPLE)
+            );
+            cli_profile
+        } else {
+            println!(
+                "{}{}{}",
+                style("Using profile (").themed(CLI_INFO),
+                style(&env_profile).themed(CLI_EXAMPLE),
+                style(") from OPENVTC_CONFIG_PROFILE ENV variable").themed(CLI_INFO)
+            );
+            env_profile
+        }
+    } else {
+        cli_profile
+    };
+
+    if profile.is_empty()
+        || !profile
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        || profile.contains("..")
+    {
+        eprintln!(
+            "{} {}",
+            style("ERROR: Invalid profile name:").themed(CLI_ERROR),
+            style(&profile).themed(CLI_CAUTION)
+        );
+        bail!("Profile name may only contain [A-Za-z0-9._-] and must not contain '..'");
+    }
+    Ok(profile)
+}
+
+// ****************************************************************************
+// MAIN Function
+// ****************************************************************************
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Optional file-based debug logging.
+    // Set OPENVTC_DEBUG_LOG to a file path to enable, e.g.:
+    //   OPENVTC_DEBUG_LOG=/tmp/openvtc.log cargo run -p openvtc
+    // Log level defaults to this workspace's own crates but can be overridden
+    // with RUST_LOG.
+    if let Ok(log_path) = env::var("OPENVTC_DEBUG_LOG") {
+        match open_debug_log(std::path::Path::new(&log_path)) {
+            Ok(log_file) => {
+                // Default to this workspace's own spans. The previous default
+                // was a bare "debug", which also turned on every dependency —
+                // hyper, the SDKs — and buried the openvtc trace in transport
+                // noise while widening what lands in the file. RUST_LOG wins.
+                let filter =
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        tracing_subscriber::EnvFilter::new("info,openvtc=debug,openvtc_core=debug")
+                    });
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::sync::Mutex::new(log_file))
+                    .with_ansi(false)
+                    .init();
+                // A run banner, because the file now spans runs: without a
+                // marker, two appended runs read as one continuous session and
+                // a restart becomes invisible in the middle of a trace.
+                tracing::info!(
+                    version = env!("CARGO_PKG_VERSION"),
+                    "───── openvtc run started ─────  (appending to {log_path})"
+                );
+                // Say where it is and what is in it. The file carries DIDs,
+                // profile names and message metadata, so an operator about to
+                // attach it to a bug report should be told before they do.
+                eprintln!(
+                    "debug log enabled at {log_path}; it may contain identifiers and message \
+                     metadata — do not share it."
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: OPENVTC_DEBUG_LOG={log_path} could not be opened ({e}); continuing without file logging"
+                );
+            }
+        }
+    }
+
+    // Parse the command line exactly once; thread the parsed values down to
+    // the call sites that need them (profile resolution, setup detection, and
+    // the unlock-code passed into `load_fast`). Unknown subcommands and
+    // `--help`/`--version` are handled here by clap (process exits).
+    let matches = cli().get_matches();
+    // Before anything is printed or drawn: every colour decision reads it.
+    if matches.get_flag("monochrome") {
+        theme::force_monochrome();
+    }
+    // Which configuration profile to use? Resolved before the theme so the theme
+    // choice can be scoped to it: the choice used to live in a single shared
+    // `tui.toml`, so a theme change under one profile repainted every other. Its
+    // informational messages print with the default palette, since the theme is
+    // not chosen yet — a rare, acceptable trade for per-profile isolation.
+    let profile = resolve_profile(&matches)?;
+    // The theme colours everything printed from here on — prompts and errors as
+    // well as the TUI — so it is chosen next, per profile. Under `auto` this asks
+    // the terminal for its background, which only works before the TUI starts.
+    let theme_roots = theme::catalog::Roots::from_env_for_profile(&profile);
+    let theme_in_use = theme::init(&theme_roots);
+    if let Some(("theme", theme_args)) = matches.subcommand() {
+        return theme_cmd::run(theme_args, &profile);
+    }
+    let theme_watcher = theme::live::Watcher::new(theme_roots, &theme_in_use);
+    // `--unlock-code-file` (a path, or `-` for standard input) takes the place of
+    // `--unlock-code`, which clap refuses alongside it. Read eagerly so a bad
+    // path fails here, with a clear message, rather than after the profile has
+    // been opened.
+    let unlock_code_arg = match matches.get_one::<String>("unlock-code-file") {
+        Some(path) => Some(SuppliedUnlockCode {
+            passphrase: cli::read_unlock_code_file(path)?,
+            from_argv: false,
+        }),
+        None => matches
+            .get_one::<String>("unlock-code")
+            .cloned()
+            .map(|passphrase| SuppliedUnlockCode {
+                passphrase,
+                from_argv: true,
+            }),
+    };
+    let setup_requested = matches!(matches.subcommand(), Some(("setup", _)));
+
+    // Optional invitation credential (VIC) to present when joining a community.
+    // Loaded eagerly so a malformed path / JSON fails fast with a clear message
+    // rather than silently dropping the invite mid-join.
+    let invitation_credential: Option<serde_json::Value> = match matches
+        .get_one::<String>("invitation")
+    {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read invitation file `{path}`: {e}"))?;
+            let vic: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("invitation file `{path}` is not valid JSON: {e}"))?;
+            // Fail fast on a stripped/summary VIC rather than silently presenting
+            // an unusable credential the VTC refers to a moderator.
+            // …and on one that is not genuinely the community's: its proof is
+            // checked against the issuer's DID document before anything —
+            // including the issuer it names — is used.
+            let resolver = affinidi_tdk::did_resolver::DIDCacheClient::new(
+                affinidi_tdk::did_resolver::config::DIDCacheConfigBuilder::default().build(),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("could not start a DID resolver to check the invitation: {e}")
+            })?;
+            openvtc_core::join::verify_invitation_credential(&vic, &resolver, chrono::Utc::now())
+                .await
+                .map_err(|e| anyhow::anyhow!("invitation file `{path}`: {e}"))?;
+            Some(vic)
+        }
+        None => None,
+    };
+
+    // Register the platform's keyring-core credential store. keyring-core 1.0
+    // doesn't auto-pick a backend — every binary registers exactly one at
+    // startup. This runs *after* profile resolution because the durable
+    // file-backed store used on Linux lives beside that profile's config.
+    init_default_keyring_store(&profile)?;
+
+    // `health` runs before the duplicate-instance check and never takes the
+    // lock. The report is read-only, and the moment you most want it is while a
+    // TUI is sitting on a join that never came back — refusing to run because
+    // that TUI holds the profile would deny the diagnosis to the one situation
+    // it exists for. Account details are best-effort for the same reason (see
+    // `health_cmd::run`): a locked or undecryptable profile degrades the report
+    // rather than aborting it.
+    if let Some(("health", health_args)) = matches.subcommand() {
+        let vtc_dids: Vec<String> = health_args
+            .get_many::<String>("vtc")
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default();
+        let as_json = health_args.get_flag("json");
+        let config = load_config_for_health(&profile, unlock_code_arg.as_ref()).await;
+        let recoverable = health_args.get_flag("recoverable");
+        let allow_private_probes = health_args.get_flag("allow-private-probes");
+        return health_cmd::run(
+            &profile,
+            config.as_ref(),
+            &vtc_dids,
+            as_json,
+            recoverable,
+            allow_private_probes,
+        )
+        .await;
+    }
+
+    // Check if profile is currently active elsewhere?
+    let lock_file = check_duplicate_instance(&profile)?;
+
+    // Headless subcommands: no TUI, the profile lock held like the TUI holds it.
+    let headless = match matches.subcommand() {
+        Some(("setup", args)) if setup_cmd::requested(args) => {
+            Some(setup_cmd::run(args, &profile).await)
+        }
+        Some((name @ ("community" | "repo"), args)) => {
+            Some(match load_fast(&profile, unlock_code_arg.as_ref()) {
+                Err(e) => Err(anyhow::anyhow!("{}", redact_paths(&e.to_string()))),
+                Ok(deferred) => match (name, args.subcommand()) {
+                    ("community", Some(("join", join))) => {
+                        state_handler::join_cmd::run(join, deferred, invitation_credential.clone())
+                            .await
+                    }
+                    ("repo", _) => repos_cmd::run(args, deferred).await,
+                    _ => Err(anyhow::anyhow!("unknown `{name}` subcommand")),
+                },
+            })
+        }
+        _ => None,
+    };
+    if let Some(result) = headless {
+        remove_lock_file(&lock_file);
+        return result;
+    }
+
+    let mut starting_mode = StartingMode::NotSet;
+
+    // Is there a CLI command to force setup wizard?
+    if setup_requested {
+        starting_mode = StartingMode::SetupWizard;
+    }
+
+    if let StartingMode::NotSet = starting_mode {
+        match load_fast(&profile, unlock_code_arg.as_ref()) {
+            Ok(deferred) => {
+                starting_mode = StartingMode::MainPageDeferred(deferred);
+            }
+            Err(OpenVTCError::ConfigNotFound(_, _)) => {
+                // Configuration not found, start in setup mode
+                starting_mode = StartingMode::SetupWizard;
+            }
+            Err(OpenVTCError::ConfigVersionUnsupported { found, expected }) => {
+                // Breaking reset (D13 / R-RST-2,3): the on-disk config predates
+                // the v2 account model and cannot be migrated. Warn explicitly,
+                // require confirmation, then delete it and run setup from scratch.
+                eprintln!(
+                    "{}",
+                    style(format!(
+                        "Your existing configuration (format v{found}) is incompatible with \
+                         this version of OpenVTC (format v{expected}) and cannot be upgraded \
+                         automatically."
+                    ))
+                    .themed(CLI_CAUTION)
+                );
+                eprintln!(
+                    "{}",
+                    style(
+                        "Continuing will DELETE the existing configuration and its stored \
+                         credentials, then start a fresh setup. This cannot be undone."
+                    )
+                    .themed(CLI_ERROR)
+                );
+                let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Delete the incompatible configuration and reset?")
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+                if !confirmed {
+                    bail!("Incompatible configuration; reset declined by user");
+                }
+                let summary = PublicConfig::delete_profile(&profile).map_err(|e| {
+                    anyhow::anyhow!("Failed to delete incompatible configuration: {e}")
+                })?;
+                for warning in &summary.warnings {
+                    eprintln!(
+                        "{}",
+                        style(format!("warning during reset: {warning}")).themed(CLI_CAUTION)
+                    );
+                }
+                starting_mode = StartingMode::SetupWizard;
+            }
+            Err(e @ (OpenVTCError::Vta(_) | OpenVTCError::Auth(_))) => {
+                // R18: a VTA connection/auth failure is a retryable runtime fault,
+                // NOT config corruption. Surface "check VTA / re-auth" guidance and
+                // reserve reset-style messaging for genuine `Config` errors below.
+                let hint = if matches!(e, OpenVTCError::Auth(_)) {
+                    "Check that your credentials are still valid and re-authenticate, then try again."
+                } else {
+                    "Check that your VTA is reachable and try again."
+                };
+                eprintln!(
+                    "{} {}",
+                    style("ERROR: Couldn't reach the VTA! Reason:").themed(CLI_ERROR),
+                    style(redact_paths(&e.to_string())).themed(CLI_CAUTION)
+                );
+                eprintln!("{}", style(hint).themed(CLI_CAUTION));
+                bail!("VTA Connection Error");
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} {}",
+                    style("ERROR: Couldn't load configuration! Reason:").themed(CLI_ERROR),
+                    style(redact_paths(&e.to_string())).themed(CLI_CAUTION)
+                );
+                bail!("Configuration Error");
+            }
+        };
+    }
+
+    // OpenVTC must be in either setup or main state
+    if let StartingMode::NotSet = starting_mode {
+        bail!("Starting mode not set correctly!");
+    }
+
+    // Trust-anchor env overrides are announced here, while stderr is still
+    // readable: once the TUI owns the terminal a stray write would corrupt the
+    // screen. The state handler applies them (dev-overrides builds only) and
+    // repeats the outcome in the Activity Log.
+    if let Some(notice) = env_overrides::startup_notice(|k| env::var(k).ok()) {
+        eprintln!("{}", style(notice).themed(CLI_CAUTION));
+    }
+
+    // Setup the initial state
+    let (terminator, mut interrupt_rx) = create_termination();
+    let (mut state, state_rx) = StateHandler::new(&profile, starting_mode);
+    state.set_invitation_credential(invitation_credential);
+    let (ui_manager, action_rx) = UiManager::new(theme_watcher, terminator.clone());
+
+    run_session(
+        state.main_loop(terminator.clone(), action_rx, interrupt_rx.resubscribe()),
+        ui_manager.main_loop(state_rx, interrupt_rx.resubscribe()),
+        terminator,
+        SHUTDOWN_GRACE,
+    )
+    .await?;
+
+    match interrupt_rx.recv().await {
+        Ok(reason) => match reason {
+            Interrupted::UserInt => println!("exited per user request"),
+            Interrupted::OsSigInt => println!("exited because of an os sig int"),
+            Interrupted::SystemError(reason) => {
+                println!(
+                    "exited because of a system error: {}",
+                    redact_paths(&reason)
+                )
+            }
+        },
+        _ => {
+            println!("exited because of an unexpected error");
+        }
+    }
+
+    remove_lock_file(&lock_file);
+    Ok(())
+}
+
+// ****************************************************************************
+// Termination Management
+// ****************************************************************************
+
+#[derive(Debug, Clone)]
+pub enum Interrupted {
+    OsSigInt,
+    UserInt,
+    SystemError(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct Terminator {
+    interrupt_tx: broadcast::Sender<Interrupted>,
+    /// Whether any clone has asked the application to stop. Shared, so
+    /// [`Terminator::ensure_terminated`] can tell a session that already said
+    /// why it ended from one that just stopped.
+    fired: Arc<AtomicBool>,
+}
+
+impl Terminator {
+    pub fn new(interrupt_tx: broadcast::Sender<Interrupted>) -> Self {
+        Self {
+            interrupt_tx,
+            fired: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn terminate(&mut self, interrupted: Interrupted) -> anyhow::Result<()> {
+        self.fired.store(true, Ordering::SeqCst);
+        self.interrupt_tx.send(interrupted)?;
+
+        Ok(())
+    }
+
+    /// Ask the application to stop with `interrupted`, unless something already
+    /// has. Used where a part of the session has ended on its own and everything
+    /// else must follow it down, without overwriting the reason the first stop
+    /// gave (the interrupt channel holds one message).
+    pub fn ensure_terminated(&mut self, interrupted: Interrupted) {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            let _ = self.interrupt_tx.send(interrupted);
+        }
+    }
+}
+
+/// How long the state handler has to finish its own shutdown — the final config
+/// save, closing the messaging runtime and the VTA session — once the screen
+/// has closed. Past this the process exits without it (R1.2): a shutdown that
+/// waits on a service that never answers must not leave someone at a blank
+/// terminal with only `kill` left.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Run the state handler and the UI together until both have stopped.
+///
+/// The UI only leaves its loop on an interrupt, and every key it reads is
+/// handed to the state handler. So once the handler has stopped, a UI still
+/// running is a screen that reads keys nobody acts on — F10, Esc, everything —
+/// and only `kill` ends it. The handler's own exits are each meant to fire the
+/// terminator first, but one that forgot (the join flow's F10 did) froze the
+/// whole application. Rather than rely on every exit path remembering, the
+/// session fires the terminator itself whenever the handler stops, however it
+/// stopped.
+///
+/// The other direction is bounded too: once the UI has gone (an interrupt, a
+/// Ctrl-C), the handler gets `grace` to finish, and the session ends with an
+/// error naming the stall rather than waiting on it forever.
+async fn run_session<H, U>(
+    handler: H,
+    ui: U,
+    mut terminator: Terminator,
+    grace: Duration,
+) -> Result<()>
+where
+    H: Future<Output = Result<Interrupted>>,
+    U: Future<Output = Result<Interrupted>>,
+{
+    let handler = async move {
+        let result = handler.await;
+        terminator.ensure_terminated(match &result {
+            Ok(interrupted) => interrupted.clone(),
+            Err(e) => Interrupted::SystemError(format!("{e:#}")),
+        });
+        result
+    };
+    tokio::pin!(handler);
+    tokio::pin!(ui);
+
+    let mut handler_result = None;
+    let ui_result = tokio::select! {
+        result = &mut ui => result,
+        result = &mut handler => {
+            handler_result = Some(result);
+            (&mut ui).await
+        }
+    };
+    let handler_result = match handler_result {
+        Some(result) => result,
+        None => match tokio::time::timeout(grace, &mut handler).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the screen closed but the session did not finish shutting down within {}s \
+                 (it may be waiting on the VTA or the mediator); exiting without it — the \
+                 last configuration change may not have been saved",
+                grace.as_secs()
+            )),
+        },
+    };
+    ui_result?;
+    handler_result?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn terminate_by_unix_signal(mut terminator: Terminator) {
+    let mut interrupt_signal = match signal(tokio::signal::unix::SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to create interrupt signal stream: {e}");
+            return;
+        }
+    };
+
+    interrupt_signal.recv().await;
+
+    if let Err(e) = terminator.terminate(Interrupted::OsSigInt) {
+        tracing::error!("Failed to send interrupt signal: {e}");
+    }
+}
+
+// create a broadcast channel for retrieving the application kill signal
+pub fn create_termination() -> (Terminator, broadcast::Receiver<Interrupted>) {
+    let (tx, rx) = broadcast::channel(1);
+    let terminator = Terminator::new(tx);
+
+    #[cfg(unix)]
+    tokio::spawn(terminate_by_unix_signal(terminator.clone()));
+
+    (terminator, rx)
+}
+
+/// Maximum number of interactive unlock attempts before aborting.
+const MAX_UNLOCK_ATTEMPTS: usize = 5;
+
+/// A non-interactive unlock passphrase, and where it came from.
+///
+/// The source is carried because only one of the two routes earns the
+/// process-list warning: `--unlock-code` puts the passphrase in argv, where any
+/// local user can read it out of `ps`, and `--unlock-code-file` exists precisely
+/// to avoid that. Warning about the safe route as well is how a warning gets
+/// trained out of people.
+struct SuppliedUnlockCode {
+    passphrase: String,
+    from_argv: bool,
+}
+
+/// Fast, synchronous load — only does local config read + terminal prompts.
+/// Network-heavy work (TDK init, DID resolution, VTA auth) is deferred to the state handler.
+fn load_fast(
+    profile: &str,
+    unlock_code_arg: Option<&SuppliedUnlockCode>,
+) -> Result<DeferredLoad, OpenVTCError> {
+    let public_config = Config::load_step1(profile)?;
+
+    let unlock_passphrase = match &public_config.protection {
+        ConfigProtectionType::Token { .. } => None,
+        ConfigProtectionType::Encrypted => {
+            if let Some(supplied) = unlock_code_arg {
+                if supplied.from_argv {
+                    eprintln!(
+                        "{}",
+                        style(
+                            "WARNING: --unlock-code exposes the passphrase in the process list; \
+                             prefer --unlock-code-file or the interactive prompt on shared \
+                             systems."
+                        )
+                        .themed(CLI_CAUTION)
+                    );
+                }
+                Some(UnlockCode::from_string(&supplied.passphrase)?)
+            } else {
+                let mut result = None;
+                for attempt in 1..=MAX_UNLOCK_ATTEMPTS {
+                    // After 3 failed attempts, add exponential backoff delay
+                    if attempt > 3 {
+                        let delay = std::time::Duration::from_secs(1 << (attempt - 3).min(3));
+                        std::thread::sleep(delay);
+                    }
+                    let input = match Password::with_theme(&ColorfulTheme::default())
+                        .with_prompt("Please enter unlock passphrase")
+                        .allow_empty_password(false)
+                        .interact()
+                    {
+                        Ok(input) => input,
+                        Err(e) => {
+                            eprintln!("Failed to read passphrase input: {e}");
+                            return Err(OpenVTCError::Config(format!(
+                                "Passphrase input failed: {e}"
+                            )));
+                        }
+                    };
+                    match UnlockCode::from_string(&input) {
+                        Ok(code) => {
+                            result = Some(code);
+                            break;
+                        }
+                        Err(e) => {
+                            let remaining = MAX_UNLOCK_ATTEMPTS - attempt;
+                            if remaining == 0 {
+                                eprintln!("Too many failed unlock attempts. Aborting.");
+                                return Err(e);
+                            }
+                            eprintln!(
+                                "WARNING: Failed unlock attempt. {} attempt{} remaining.",
+                                remaining,
+                                if remaining == 1 { "" } else { "s" }
+                            );
+                        }
+                    }
+                }
+                result
+            }
+        }
+        ConfigProtectionType::Plaintext => None,
+    };
+
+    // Only a Token-protected profile ever talks to a card, so only that one asks
+    // for a PIN. There used to be a literal placeholder PIN here for every other
+    // protection type; `None` says the same thing without compiling a PIN into
+    // the binary.
+    #[cfg(feature = "openpgp-card")]
+    let user_pin = if matches!(&public_config.protection, ConfigProtectionType::Token(_)) {
+        Some(
+            get_user_pin()
+                .map_err(|e| OpenVTCError::Config(format!("Failed to get user PIN: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(DeferredLoad {
+        profile: profile.to_string(),
+        public_config,
+        unlock_passphrase,
+        #[cfg(feature = "openpgp-card")]
+        user_pin,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for `UiManager::main_loop`: like it, it leaves only on an
+    /// interrupt.
+    async fn ui_until_interrupted(
+        mut interrupt_rx: broadcast::Receiver<Interrupted>,
+    ) -> Result<Interrupted> {
+        loop {
+            match interrupt_rx.recv().await {
+                Ok(interrupted) => return Ok(interrupted),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    anyhow::bail!("interrupt channel closed")
+                }
+            }
+        }
+    }
+
+    fn termination() -> (Terminator, broadcast::Receiver<Interrupted>) {
+        let (tx, rx) = broadcast::channel(1);
+        (Terminator::new(tx), rx)
+    }
+
+    /// The join-page freeze: the state handler stopped (F10 on a join page)
+    /// without firing the terminator, and the UI — which only stops on an
+    /// interrupt — stayed up forever reading keys nobody acted on. With the
+    /// handler and UI joined by `try_join!` this never finished.
+    #[tokio::test]
+    async fn the_screen_never_outlives_a_handler_that_stopped_without_saying_so() {
+        let (terminator, rx) = termination();
+        let ui = ui_until_interrupted(rx.resubscribe());
+        // Returns as the join flow's F10 did: an outcome, but no interrupt.
+        let handler = async { Ok(Interrupted::UserInt) };
+
+        let session = run_session(handler, ui, terminator, Duration::from_secs(5));
+        tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends once the handler has stopped")
+            .expect("a clean stop is not an error");
+    }
+
+    /// A handler that failed takes the screen down with it (restoring the
+    /// terminal) instead of leaving it up, and the failure is what the session
+    /// reports.
+    #[tokio::test]
+    async fn a_failed_handler_closes_the_screen_and_reports_why() {
+        let (terminator, mut rx) = termination();
+        let ui = ui_until_interrupted(rx.resubscribe());
+        let handler = async { Err(anyhow::anyhow!("the TDK would not start")) };
+
+        let session = run_session(handler, ui, terminator, Duration::from_secs(5));
+        let result = tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the session ends");
+        assert!(result.is_err(), "the handler's failure is reported");
+        match rx.recv().await {
+            Ok(Interrupted::SystemError(reason)) => {
+                assert!(reason.contains("TDK"), "{reason}");
+            }
+            other => panic!("the screen was told why it closed, got {other:?}"),
+        }
+    }
+
+    /// A handler that already said why it stopped keeps its reason: the
+    /// session does not overwrite it (the channel holds one message).
+    #[tokio::test]
+    async fn a_reason_already_given_is_not_overwritten() {
+        let (terminator, mut rx) = termination();
+        let ui = ui_until_interrupted(rx.resubscribe());
+        let mut inner = terminator.clone();
+        let handler = async move {
+            inner.terminate(Interrupted::OsSigInt)?;
+            Ok(Interrupted::OsSigInt)
+        };
+
+        run_session(handler, ui, terminator, Duration::from_secs(5))
+            .await
+            .expect("a clean stop");
+        assert!(matches!(rx.recv().await, Ok(Interrupted::OsSigInt)));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing was sent after the handler's own reason"
+        );
+    }
+
+    /// The other direction: the screen closed (Ctrl-C) but the handler is
+    /// stuck on something that never answers. The session gives up after the
+    /// grace period, with an error that says so, rather than hanging.
+    #[tokio::test]
+    async fn a_stuck_handler_cannot_hold_the_process_after_the_screen_closed() {
+        let (mut terminator, rx) = termination();
+        let ui = ui_until_interrupted(rx.resubscribe());
+        let handler = std::future::pending::<Result<Interrupted>>();
+        terminator.ensure_terminated(Interrupted::UserInt);
+
+        let session = run_session(handler, ui, terminator, Duration::from_millis(100));
+        let result = tokio::time::timeout(Duration::from_secs(2), session)
+            .await
+            .expect("the grace period bounds the wait");
+        let error = result.expect_err("a handler that never finished is an error");
+        assert!(
+            error.to_string().contains("did not finish shutting down"),
+            "{error}"
+        );
+    }
+
+    /// A private directory under the system temp dir, following the convention
+    /// the rest of this crate's tests use.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("openvtc-debuglog-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test directory");
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn debug_log_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("mode");
+        let path = dir.join("openvtc.log");
+        let file = open_debug_log(&path).expect("a fresh path opens");
+        drop(file);
+
+        let mode = std::fs::metadata(&path)
+            .expect("the log exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the debug log carries identifiers, so it must not be readable by other local users"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn debug_log_tightens_a_loose_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("tighten");
+        let path = dir.join("openvtc.log");
+        std::fs::write(&path, b"from an earlier run\n").expect("seed the log");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen the log");
+
+        let file = open_debug_log(&path).expect("an existing path opens");
+        drop(file);
+
+        let mode = std::fs::metadata(&path)
+            .expect("the log exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a log left loose by an earlier run is tightened"
+        );
+        // Tightening must not cost the earlier run's evidence.
+        assert_eq!(
+            std::fs::read(&path).expect("read the log"),
+            b"from an earlier run\n",
+            "the existing contents are appended to, not truncated"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn debug_log_refuses_a_symlink() {
+        let dir = temp_dir("symlink");
+        let target = dir.join("target.log");
+        let link = dir.join("link.log");
+        std::fs::write(&target, b"").expect("create the target");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).expect("create the symlink");
+
+        let err = open_debug_log(&link).expect_err("a symlink must be refused");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "a pre-planted link is an error, not a target: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read the target").len(),
+            0,
+            "nothing was written through the link"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
